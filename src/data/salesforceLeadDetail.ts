@@ -1,7 +1,9 @@
-import { liveBookedLead } from "./salesforceLiveLead";
+import { liveBookedLead, leadSlug } from "./salesforceLiveLead";
+import type { LsaQuote } from "./QuoteCaptureContext";
 import type { CustomerProfile, VoiceConversation } from "./schema";
-import { salesforceLeads, type SfLead } from "./salesforceLeads";
+import { salesforceLeads, products, productList, type SfLead } from "./salesforceLeads";
 import { salesforceCallLog } from "./salesforceCallLog";
+import { derive as derivePlace } from "./prospectPlace";
 
 /* =============================================================================
    The Lead record page — and the Invoca Captured Attribution section is the point
@@ -208,8 +210,9 @@ export function offerFromCall(profile: CustomerProfile): string {
   return "";
 }
 
-/** "Invoca for Home Services" -> "Home Services". */
-function lineOfBusiness(profile: CustomerProfile): string {
+/** "Invoca for Home Services" -> "Home Services". Exported so `smsInfoAttribution`
+ *  below reuses the identical derivation rather than a second copy of it. */
+export function lineOfBusiness(profile: CustomerProfile): string {
   const n = String(profile.networkName ?? "").replace(/^invoca\s+for\s+/i, "").trim();
   return n || String(profile.industry ?? "");
 }
@@ -229,8 +232,12 @@ export function salesforceLeadDetail(
      captures, that list does not contain the lead and the chip opens "Lead not found". Opt-in
      and last, so both audits still exercise the derived ten. */
   voiceCalls?: VoiceConversation[],
+  /* ⚠️ THE SAME REASON, for the second live source: the Leads list now also contains the lead
+     an LSA quote request created, and a record page that resolves its slug against a list
+     built WITHOUT the quotes opens "Lead not found" on the row the SE just made. */
+  quotes?: LsaQuote[],
 ): SfLeadDetail | null {
-  const view = salesforceLeads(profile, voiceCalls);
+  const view = salesforceLeads(profile, voiceCalls, quotes);
   const i = view.leads.findIndex((l) => l.slug === slug);
   if (i === -1) return null;
   const lead = view.leads[i];
@@ -262,6 +269,79 @@ export function salesforceLeadDetail(
      sections stay blank, exactly as captured and as previously asked. */
   const live = liveBookedLead(profile, voiceCalls);
   const isLive = live && live.lead.slug === slug;
+
+  /* The quote request's own record fields. Lead Source is "Web" rather than "Inbound Call"
+     because that is what actually happened — they typed into a Google ad, they did not ring —
+     and the Description carries what they wrote, which is the thing a rep opens this page to
+     read. No address: the form never asked for one, and inventing a street for somebody who
+     only gave a phone number would be fabricating the one field a rep would act on. */
+  const q = (quotes ?? [])[0];
+  const isQuote = !isLive && !!q && leadSlug(...(() => {
+    const parts = (q.name || "").trim().split(/\s+/);
+    return [parts[0] ?? "", parts.slice(1).join(" ")] as [string, string];
+  })()) === slug;
+  const quoteExtra = isQuote && q
+    ? {
+        leadSource: "Web",
+        description: `Quote request from the Google Local Services ad: "${q.message.trim()}"`
+          + (q.service.trim() ? ` Service selected: ${q.service.trim()}.` : "")
+          + ` Preferred contact: ${q.how === "sms" ? "SMS or phone call" : "email"} (${q.contact}).`,
+      }
+    : {};
+
+  /* =============================================================================
+     A LEAD SUBMITTED VIA THE LSA'S OWN "GET QUOTE" DIALOG CARRIES LSA ATTRIBUTION
+     -----------------------------------------------------------------------------
+     Asked for directly: "When a lead is submitted via the LSAs I want the Invoca Captured
+     Attribution have LSA data for example the Marketing Source should say Local Services
+     Ads." Before this every lead — however it was created — took its Marketing Source /
+     Medium / Campaign / Search Terms from the SAME generic `digitalInsights` row, picked
+     purely by list position. A person who typed into the Local Services ad's own dialog is
+     not a generic web visitor; Google attributes that conversion to the ad unit itself, not
+     to a Paid Search or Organic click, and the record should say so.
+
+     ⚠️⚠️ **THE WHOLE ROW IS REPLACED, NOT ONE FIELD — same rule this file's own header states
+     ("the row is taken WHOLE, not field by field").** Setting only Marketing Source to "Local
+     Services Ads" while leaving Medium at whatever a random digitalInsights row happened to
+     hold (say, "Organic") reproduces the exact "Medium: Bing, Source: Paid Search"
+     contradiction this file was written to avoid — just with a different wrong pair.
+
+     ⚠️ **EVERY VALUE IS REAL, NOT INVENTED, reusing what the Google Search screen itself
+     already computed for this exact ad unit** (`prospectPlace.derive`): the Marketing
+     Campaign is the FULL campaign row name the click is tagged with (`adCampaign`, the same
+     value that reaches `utm_campaign` on the real link, so an SE can open the matching row on
+     the Marketing dashboard), and the Marketing Search Terms is the actual keyword the
+     "searcher" typed (`query`) — not a phrase re-derived from a transcript word.
+
+     ⚠️ **"lsa" AS THE MEDIUM, NOT INVENTED EITHER** — it is the exact `utm_medium=lsa` value
+     `bookingHandoffUrl` already stamps on the real "Book online" link for this same ad unit,
+     so a prospect checking one against the other finds the same word.
+
+     ⚠️ **NO WEBSITE CALLING PAGE, DELIBERATELY, AND THAT IS THE HONEST ANSWER — not a gap.**
+     A Local Services ad's "Get quote" dialog is answered ON the search results page; nobody
+     visits a landing page first, which is the entire point of the ad format. Leaving this
+     blank is the same convention this very screen already uses for Company/Title/Rating/
+     Website/Industry — an empty `<Field>` — not a placeholder needing an em dash.
+
+     ⚠️ **GATED ON `q.source`, DEFAULTING TO "lsa"** (see the field's own comment in
+     `QuoteCaptureContext.tsx`) so a quote captured before that field existed still gets this
+     treatment, and a Replicate-page WEB FORM submission (`source: "web"`) — which really is a
+     generic site visit, just on the prospect's own replicated page — keeps the normal
+     digitalInsights-row attribution instead. */
+  const isLsaQuote = isQuote && (q?.source ?? "lsa") === "lsa";
+  const lsaAttribution = isLsaQuote
+    ? (() => {
+        const ad = derivePlace(profile);
+        return {
+          marketingSource: "Local Services Ads",
+          marketingMedium: "lsa",
+          marketingCampaign: ad.adCampaign,
+          marketingSearchTerms: ad.query,
+          websiteJourney: "Google Local Services Ads listing",
+          websiteCallingPage: "",
+        };
+      })()
+    : null;
   const extra = isLive
     ? {
         /* The street is invented and deliberately place-NEUTRAL, while the city, state and ZIP
@@ -280,6 +360,7 @@ export function salesforceLeadDetail(
 
   return {
     ...extra,
+    ...quoteExtra,
     lead,
     index: i + 1,
     attribution: {
@@ -294,12 +375,12 @@ export function salesforceLeadDetail(
         || categoryFor(catRows, lead.product || productName, i),
       productName,
       productPromotion: (r.agentConfig?.smsPlaybook?.offer || "").trim() || offerFromCall(profile),
-      marketingSource: row?.marketingSource ?? "",
-      marketingMedium: row?.marketingMedium ?? "",
-      marketingCampaign: row?.marketingCampaign ?? "",
-      marketingSearchTerms: row?.marketingSearchTerm ?? "",
-      websiteJourney: row?.websiteJourney ?? "",
-      websiteCallingPage: row?.landingPageUrl ?? "",
+      marketingSource: lsaAttribution?.marketingSource ?? row?.marketingSource ?? "",
+      marketingMedium: lsaAttribution?.marketingMedium ?? row?.marketingMedium ?? "",
+      marketingCampaign: lsaAttribution?.marketingCampaign ?? row?.marketingCampaign ?? "",
+      marketingSearchTerms: lsaAttribution?.marketingSearchTerms ?? row?.marketingSearchTerm ?? "",
+      websiteJourney: lsaAttribution?.websiteJourney ?? row?.websiteJourney ?? "",
+      websiteCallingPage: lsaAttribution?.websiteCallingPage ?? row?.landingPageUrl ?? "",
     },
     /* One call log record per lead, off the object that owns that numbering — so the
        record named here exists in the Invoca Call Log tab's own list.
@@ -321,5 +402,72 @@ export function salesforceLeadDetail(
     owner: "Bill Hyatt",
     createdAt: lead.created,
     modifiedAt: lead.created,
+  };
+}
+
+/* =============================================================================
+   smsInfoAttribution — the SAME attribution on the SMS Info "Marketing Data" card
+   -----------------------------------------------------------------------------
+   Asked for directly: "add all the marketing data for this SMS Info, like all the
+   data that you have added to the salesforce lead." The card had two generic
+   fields (destination time zone, session status); this adds the real eleven —
+   same labels, same derivation, so a prospect who has just looked at the Lead
+   record does not find a second, different-looking answer here.
+
+   ⚠️⚠️ WHEN THE CALLER IS SOMEONE `salesforceLeads.ts` ALREADY NAMES, THIS IS
+   LITERALLY THAT SAME LEAD RECORD, NOT A LOOK-ALIKE. `salesforceLeads.ts` builds
+   its rows from FOUR sources — voice screen-pop, SMS screen-pop, voice CI, SMS
+   CI — because a profile's named callers are scattered across all four, and an
+   SMS conversation's caller is just as likely to be the VOICE screen-pop's
+   person as the SMS one's (verified on Shady Blinds: the seeded active SMS
+   conversation's caller, "Jessica Harper", is `voiceScreenpop.callerName`, not
+   `smsScreenpop.callerName`, which is "Marcus Bell"). Checking only the SMS
+   screen-pop missed exactly that case. Re-deriving a second, independent
+   attribution for a person who already has a real Lead risks the two
+   disagreeing — the "Medium: Bing, Source: Paid Search" failure this file's own
+   header warns about, one level up — so this checks BOTH screen-pops' caller
+   names and, on a match, routes through `salesforceLeadDetail` for that exact
+   person, sharing their numbers by construction.
+
+   ⚠️ EVERY OTHER CALLER (an inactive shell, or a captured chat with a name
+   neither screen-pop mentions) has no Lead record to borrow, so this falls
+   back to the SAME functions with a stable index derived from THAT caller's own
+   name — still one coherent `digitalInsights` row, still the same category and
+   promotion logic, just not claiming to be a specific person's CRM record. */
+export function smsInfoAttribution(profile: CustomerProfile, callerName: string): SfLeadAttribution {
+  const ss = profile.reports.smsScreenpop;
+  const vs = profile.reports.voiceScreenpop;
+  const name = String(callerName ?? "").trim();
+  const lower = name.toLowerCase();
+  if (name && (lower === ss?.callerName?.trim().toLowerCase() || lower === vs?.callerName?.trim().toLowerCase())) {
+    const parts = name.split(/\s+/);
+    const matched = salesforceLeadDetail(profile, leadSlug(parts[0], parts.slice(1).join(" ")));
+    if (matched) return matched.attribution;
+  }
+
+  const r = profile.reports;
+  const idx = hash(`sms-info-attr:${profile.id}:${name || "unknown"}`);
+
+  const rows = [...(r.digitalInsights?.rows ?? [])].sort((a, b) => filled(b) - filled(a));
+  const row = rows.length ? rows[idx % rows.length] : undefined;
+
+  const catRows = categoryRows(profile);
+  const list = productList(ss?.products);
+  const lowerList = products(ss?.products);
+  const product = list.length ? list[idx % list.length] : "";
+  const productLower = lowerList.length ? lowerList[idx % lowerList.length] : "";
+
+  return {
+    lineOfBusiness: lineOfBusiness(profile),
+    productOfInterest: productLower,
+    productCategory: strongLexical(catRows, product) || categoryFor(catRows, product, idx),
+    productName: product,
+    productPromotion: (r.agentConfig?.smsPlaybook?.offer || "").trim() || offerFromCall(profile),
+    marketingSource: row?.marketingSource ?? "",
+    marketingMedium: row?.marketingMedium ?? "",
+    marketingCampaign: row?.marketingCampaign ?? "",
+    marketingSearchTerms: row?.marketingSearchTerm ?? "",
+    websiteJourney: row?.websiteJourney ?? "",
+    websiteCallingPage: row?.landingPageUrl ?? "",
   };
 }

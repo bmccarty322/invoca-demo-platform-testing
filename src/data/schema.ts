@@ -428,6 +428,18 @@ export const SmsConversation = z.object({
   transcript: z.array(SmsTurn),              // [] for inactive
   signals: z.array(CISignal),                // [] for inactive (Analysis tab)
   smsInfo: SmsInfo.optional(),               // present for active
+  /* ⚠️⚠️ **APP-WRITTEN, NEVER GENERATED — and it MUST stay out of the generation schema.**
+     Set by `buildConversation` when the thread opened with a quote-request lead-in, which is
+     what files it under the "AI SMS Conversation Intelligence (LSA)" report instead of the
+     general one. `toSchema()` runs `sanitize()`, which marks every property required, so an
+     `.optional()` field in a GENERATED type is FORCED onto the model — it would then flag
+     seeded conversations as LSA ones and the LSA report would list threads no quote ever
+     produced. Same class as `InteractionRow.cells` and `VoiceConversation.outcome`; same fix,
+     `SMS_CI_GEN` omits it. Add anything else app-written to that omit in the same commit.
+     ⚠️ A quote submitted on a REPLICATED BOOKING PAGE (`source: "web"`) also lands here. The
+     beat is identical — a form submission the agent replies to — and the report keeps the name
+     it was asked for; only the lead-in's channel wording differs. */
+  lsa: z.boolean().optional(),
 });
 export const SmsConversationIntelligenceView = z.object({
   countLabel: z.string(),                    // "5,139 calls"
@@ -739,6 +751,48 @@ export const WorkflowBranch = z.object({
 });
 export type WorkflowBranch = z.infer<typeof WorkflowBranch>;
 
+/* THE CUSTOMER SUPPORT PLAYBOOK — what a CUSTOMER-FACING demo's Support agent knows and does
+   (built for the standalone customer demo; see engine/supportGen.ts).
+
+   ⚠️ IT IS ONE STRUCTURED OBJECT RENDERED TWO WAYS, ON PURPOSE. The SMS and the voice Support
+   agents read the same playbook, so they can never disagree about what a billing question or
+   a cancellation gets, and the workflow diagram draws its branches from the same scenarios.
+   Stored ON the ExtraWorkflow that uses it and never in a generation schema: `toSchema()`'s
+   sanitize() forces every optional field onto the model, and this is written by a dedicated
+   call (or the deterministic fallback), not by the profile pipeline.
+
+   ⚠️ THE ACCOUNT IS INVENTED, AND SAYS SO. The demo's premise is that the agent is integrated
+   with the customer's billing / CRM / ticketing systems, which no demo has — so `customer`
+   is a made-up existing customer and every figure in a scenario is made up to match it. The
+   prompt states outright that this is demo data, so the agent never presents it as real to
+   anybody who is not playing the part. */
+export const SupportScenario = z.object({
+  id: z.string(),                       // kebab-case, unique within the playbook
+  title: z.string(),                    // "Billing question"
+  whoCalls: z.string(),                 // who, in this business, actually raises this
+  opener: z.string(),                   // a realistic first message from that person
+  lookup: z.string(),                   // what the agent pulls up, with the invented facts
+  resolve: z.array(z.string()),         // ordered steps that CONTAIN it without a human
+  escalateWhen: z.array(z.string()),    // the specific situations that must go to a person
+});
+export type SupportScenario = z.infer<typeof SupportScenario>;
+
+export const SupportPlaybook = z.object({
+  customer: z.object({
+    name: z.string(),                   // the invented existing customer (matches the screen-pop caller when there is one)
+    account: z.string(),                // "Account 48213"
+    summary: z.array(z.string()),       // 4-7 invented facts: plan, balance, last payment, next visit...
+  }),
+  systems: z.array(z.string()),         // the systems the agent is assumed to be integrated with
+  scenarios: z.array(SupportScenario),
+  escalation: z.object({
+    directLine: z.string(),             // a reserved 555 number that skips every AI agent
+    hours: z.string(),                  // when a human answers it
+    callbackWindow: z.string(),         // how soon a scheduled callback happens
+  }),
+});
+export type SupportPlaybook = z.infer<typeof SupportPlaybook>;
+
 export const ExtraWorkflow = z.object({
   slug: z.string(),                     // URL segment under /workflow/<slug>
   label: z.string(),                    // "Reyes Law - SMS - Nurture"
@@ -749,12 +803,40 @@ export const ExtraWorkflow = z.object({
   branches: z.array(WorkflowBranch),
   systemPrompt: z.string(),             // the agent's playbook, used by Preview Agent
   openingMessage: z.string().optional(),// what the agent texts first
+  /* THE ORDERED FLOW, AS A LIST — the SMS counterpart to the voice spec's `informSteps`.
+     ⚠️ **IT EXISTS SO Ask AI CAN EDIT THE FLOW SURGICALLY.** `systemPrompt` is one prose blob:
+     a model asked to "make it confirm the facility first" has to rewrite the whole thing, and
+     `editGuard` sees one giant string diff rather than a list whose length is its content. The
+     voice page settled this shape already — `agent.informSteps` is a `string[]` and is why
+     "drop the step that asks for a name" works there. This is the same field for SMS, so the
+     two channels' Ask AI behave the same way instead of one being a second-class surface.
+     ⚠️ **OPTIONAL, AND ABSENT ON EVERY WORKFLOW AUTHORED BEFORE IT.** Avi & Co and Reyes Law
+     carry their flow inside `systemPrompt` prose; with no `playbookSteps` nothing is appended
+     and their prompts are byte-identical. Authoring BOTH would be the duplicated-field trap
+     this repo has paid for three times (the greeting copied into `rules`, the ZIP allow-list
+     against the steps): put the flow here OR in the prose, never in both. */
+  playbookSteps: z.array(z.string()).optional(),
   /* The locations a BOOKING voice workflow can book into, e.g. Avi & Co's three boutiques.
      ⚠️ ITS PRESENCE IS WHAT MARKS THE WORKFLOW AS A BOOKING ONE — there is deliberately no
      separate `mode` flag to drift out of step with it. A booking agent with nowhere to book
      is not a state worth representing, and the locations are the thing an SE actually types.
      Absent on every existing workflow, so all of them still parse and still route. */
   bookingLocations: z.array(z.string()).optional(),
+  /* ⚠️⚠️ THE OPENER IS THIS WORKFLOW'S CONTENT, NOT A FALLBACK (9/12/2026).
+     `buildSmsBrain` ranks a stored `smsPlaybook.greeting` above a workflow's own
+     `openingMessage`, which is the correct fix for the 9/3 silent no-op — an SE's edited
+     greeting must beat a line authored into a workflow months earlier. A workflow GENERATED
+     from a live form submission inverts that: its opener quotes the words somebody typed
+     seconds ago, so the stored greeting is the stale one. Set ONLY by `quoteWorkflow`; absent
+     on every authored workflow, so none of them changes behaviour.
+     ⚠️ Safe as `.optional()` because `ExtraWorkflow` is NOT part of any generation schema —
+     `toSchema()`'s `sanitize()` would otherwise force it onto the model (the trap that made
+     the engine invent `InteractionRow.cells`). Verified: no engine phase writes extraWorkflows. */
+  openingMessageWins: z.boolean().optional(),
+  /* Present only on a customer Support workflow. Its presence selects the containment-first
+     support prompt on BOTH channels (see `supportPlaybook` on ChatBrain); absent on every
+     other workflow, so none of them changes. Not part of any generation schema. */
+  support: SupportPlaybook.optional(),
 });
 export type ExtraWorkflow = z.infer<typeof ExtraWorkflow>;
 

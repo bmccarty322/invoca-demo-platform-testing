@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useEffect, useRef, useState, type ReactNode } from "react";
+import { CUSTOMER } from "../customer/mode";
 import { getByPath, isLockedEdit, isStructuralChange } from "./editGuard";
 
 /* Global state for the "Ask AI" dashboard assistant. Holds:
@@ -145,6 +146,31 @@ interface Scope {
      `?wf=`: seeding it would leak one workflow's opener into the built-in agent and into
      every other workflow's chat. */
   greetingFallback?: string;
+  /* ⚠️⚠️ **THE FALLBACK OUTRANKS THE STORED GREETING FOR ONE WORKFLOW KIND (9/15/2026).**
+     `buildSmsBrain` lets a workflow that sets `openingMessageWins` jump ahead of
+     `smsPlaybook.greeting`, because its opener quotes what somebody typed into a form seconds
+     ago. The drawer re-implements that precedence to decide which line to SHOW, and it did not
+     know about the jump — so on the three profiles that ship a stored greeting (Aptive, Denver
+     Health, Marriott) the OPENING MESSAGE row read the generic line while the phone sent the
+     LSA one. Caught in the browser: the phone said "Hi Harold… You told us: 'Wasp nest…'" and
+     the row said "Hi, this is Aptive's AI agent." That is the drawer-shows-a-line-nobody-sends
+     defect this file already records twice; this flag is what keeps the two in step. */
+  greetingWins?: boolean;
+  /**
+   * ANOTHER scope this page may also edit, and the prefix its data appears under.
+   *
+   * ⚠️⚠️ **THIS IS WHAT MAKES ASK AI BI-DIRECTIONAL (9/17/2026).** Asked for directly: "if i use
+   * ask AI to make changes, it should make those changes in the workflow." The Preview Agent's
+   * drawer edits `agentConfig` in its OWN scope, so before this an instruction like "ask about
+   * termites first" could only ever move the agent's playbook — never the diagram.
+   * ⚠️ **A SECOND KEY, NOT A COPY FOLDED INTO THIS ONE.** Registering the workflow's fields in
+   * the preview's scope would store a SECOND copy of every question, and two homes for one value
+   * is the duplicated-field trap behind all three of the 8/27 voice bugs. Edits whose path starts
+   * with `linkAs` are stripped of that prefix and applied to `linkKey`, so they land on the one
+   * place that owns them and the diagram redraws from it.
+   */
+  linkKey?: string;
+  linkAs?: string;
 }
 /* `hidden` is part of the snapshot so Undo restores a tile you removed. Hiding is
    never destructive: the data stays exactly where it was and only the card stops
@@ -157,7 +183,7 @@ interface AiAssistantCtx {
   openDrawer: (focus?: AssistantFocus) => void;
   closeDrawer: () => void;
   active: Scope | null;
-  registerScope: (scope: { key: string; customerName: string; baseTitle: string; baseData: unknown; questionPath?: string; greetingFallback?: string }) => void;
+  registerScope: (scope: { key: string; customerName: string; baseTitle: string; baseData: unknown; questionPath?: string; greetingFallback?: string; greetingWins?: boolean; linkKey?: string; linkAs?: string }) => void;
   /* Make a key EDITABLE without making it the active scope. applyEdits refuses a
      key with no base, so a page editing another page's data must ensure that base
      exists first; a second registerScope would do it but is last-write-wins and
@@ -279,16 +305,25 @@ export function AiAssistantProvider({ children }: { children: ReactNode }) {
     return () => clearTimeout(t);
   }, [store, activeDemo]);
 
-  const openDrawer = useCallback((f?: AssistantFocus) => { setFocus(f ?? null); setOpen(true); }, []);
+  /* Customer build: no AI assist anywhere. The sparkles are also hidden in CSS, but this is the
+     guarantee — no code path can open the drawer. Dead code in the staff app. */
+  const openDrawer = useCallback((f?: AssistantFocus) => { if (CUSTOMER) return; setFocus(f ?? null); setOpen(true); }, []);
   const closeDrawer = useCallback(() => setOpen(false), []);
 
-  const registerScope = useCallback((s: { key: string; customerName: string; baseTitle: string; baseData: unknown; questionPath?: string; greetingFallback?: string }) => {
+  const registerScope = useCallback((s: { key: string; customerName: string; baseTitle: string; baseData: unknown; questionPath?: string; greetingFallback?: string; greetingWins?: boolean; linkKey?: string; linkAs?: string }) => {
     baseRef.current[s.key] = s.baseData;
+    /* ⚠️ EVERY FIELD HAS TO APPEAR TWICE HERE — in the equality test AND in the object — and
+       forgetting the second half type-checks perfectly while silently dropping the field, which
+       is how `linkKey` first arrived at the drawer as `undefined`. Caught by reading this body
+       rather than by the compiler. */
     setActive((prev) => (
       prev && prev.key === s.key && prev.baseTitle === s.baseTitle && prev.questionPath === s.questionPath
-        && prev.greetingFallback === s.greetingFallback
+        && prev.greetingFallback === s.greetingFallback && prev.greetingWins === s.greetingWins
+        && prev.linkKey === s.linkKey && prev.linkAs === s.linkAs
         ? prev
-        : { key: s.key, customerName: s.customerName, baseTitle: s.baseTitle, questionPath: s.questionPath, greetingFallback: s.greetingFallback }
+        : { key: s.key, customerName: s.customerName, baseTitle: s.baseTitle, questionPath: s.questionPath,
+            greetingFallback: s.greetingFallback, greetingWins: s.greetingWins,
+            linkKey: s.linkKey, linkAs: s.linkAs }
     ));
   }, []);
 

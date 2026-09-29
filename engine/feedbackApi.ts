@@ -22,7 +22,8 @@ import {
   isAllowedType, isInlineSafeImage, MAX_FILE_BYTES, MAX_FILES,
   STATUSES, TERMINAL, type FeedbackRecord, type FeedbackStatus, type FeedbackUser,
 } from "./feedbackStore.ts";
-import { sendMail, completionEmail, mailConfigured } from "./mailer.ts";
+import { sendMail, completionEmail, newItemEmail, mailConfigured } from "./mailer.ts";
+import { adminEmails } from "./demoApi.ts";
 
 export interface ApiResult {
   status: number;
@@ -68,8 +69,16 @@ export async function handleFeedbackApi(
   const p = urlPath.split("?")[0].replace(/\/+$/, "");
   if (!p.startsWith("/api/feedback")) return null;   // not ours
 
+  const me = (user.email || "").toLowerCase();
+  /* ⚠️ A CALLBACK BELONGS TO WHOEVER SHARED THE DEMO. Its submitter is a synthetic
+     `share:<slug>` identity nobody signs in as, so the usual "the submitter sees their own"
+     rule would hide every callback from the SE it is for — and the SE is exactly who has to
+     ring the customer back, admin or not. Ownership is by `ownerEmail`, checked on the
+     record, so an SE still cannot see anybody else's. */
   const mine = (r: FeedbackRecord) =>
-    (r.submitter?.email || "").toLowerCase() === (user.email || "").toLowerCase();
+    r.kind === "callback"
+      ? (r.callback?.ownerEmail || "").toLowerCase() === me
+      : (r.submitter?.email || "").toLowerCase() === me;
 
   if (p === "/api/feedback") {
     if (method === "GET") {
@@ -88,6 +97,7 @@ export async function handleFeedbackApi(
           open: {
             feedback: visible.filter((r) => r.kind === "feedback" && isOpen(r)).length,
             feature: visible.filter((r) => r.kind === "feature" && isOpen(r)).length,
+            callback: visible.filter((r) => r.kind === "callback" && isOpen(r)).length,
           },
         });
       }
@@ -125,7 +135,41 @@ export async function handleFeedbackApi(
         updatedAt: now,
         history: [{ at: now, status: STATUSES[0], by: { email: user.email, name: user.name } }],
       };
-      return ok({ item: saveFeedback(rec) });
+      const saved = saveFeedback(rec);
+
+      /* ⚠️⚠️ TELL THE MAINTAINER, because until 9/10/2026 nothing did. The only
+         mail this app sent was the completion notice to the SUBMITTER, so the sole
+         signal that anything had arrived was the Inbox badge on the LIVE launch
+         screen — and that badge is per-instance, so working on localhost showed
+         the local store's count instead. Three colleagues' reports sat In review
+         for over two weeks before anyone noticed.
+
+         ⚠️ AWAITED, NOT FIRE-AND-FORGET. A floating promise can be killed by the
+         SIGTERM drain mid-deploy, which is precisely when a submission is most
+         likely to be the last thing through. `sendMail` never throws and returns
+         its outcome, so awaiting cannot fail the submission — the item is already
+         on disk by this line either way. */
+      const recipients = adminEmails().filter(
+        /* ⚠️ NEVER MAIL THE SUBMITTER THEIR OWN ITEM. The maintainer files most of
+           the feature requests here, and an inbox full of your own notes is the
+           "permanent 0 badge" mistake: a notification that is usually about
+           nothing teaches you to stop reading it. */
+        (email) => email !== (user.email || "").trim().toLowerCase(),
+      );
+      for (const to of recipients) {
+        const res = await sendMail(newItemEmail({
+          to,
+          kind: saved.kind,
+          title: saved.title,
+          body: saved.body,
+          submitterName: saved.submitter?.name ?? "",
+          submitterEmail: saved.submitter?.email ?? "",
+          page: saved.page,
+          boardUrl: `${baseUrl}/feedback`,
+        }));
+        if (!res.sent) console.log(`[feedback] no notice to ${to}: ${res.reason}`);
+      }
+      return ok({ item: saved });
     }
     return err(405, "Method not allowed.");
   }
@@ -205,7 +249,9 @@ export async function handleFeedbackApi(
   /* Triage is an admin action. A submitter marking their own request Complete
      would both skew the board and mail themselves. */
   if (method === "PATCH") {
-    if (!isAdmin) return err(403, "Only an admin can change status.");
+    /* Triage is an admin action, with one exception: the SE who shared a demo works their own
+       callbacks (they are the one calling back), but only those. */
+    if (!isAdmin && !(rec.kind === "callback" && mine(rec))) return err(403, "Only an admin can change status.");
     const next = String(body?.status ?? "") as FeedbackStatus;
     if (next && !STATUSES.includes(next)) return err(400, "Unknown status.");
     const now = new Date().toISOString();
@@ -221,7 +267,9 @@ export async function handleFeedbackApi(
          later save while the item sits in a terminal status would mail the person
          again, and "your request is done" arriving three times is worse than it
          never arriving. */
-      if (TERMINAL.includes(next) && !rec.notifiedAt) {
+      /* ⚠️ NEVER FOR A CALLBACK: its submitter is `share:<slug>`, not an address, and the "your
+         request is done" note would be addressed to nobody. */
+      if (TERMINAL.includes(next) && !rec.notifiedAt && rec.kind !== "callback") {
         mailed = await sendMail(completionEmail({
           to: rec.submitter.email,
           name: rec.submitter.name,

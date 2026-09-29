@@ -2,9 +2,16 @@ import { useEffect, useRef, useState, useMemo } from "react";
 import { useProfile } from "../data/ProfileContext";
 import { useSmsCapture } from "../data/SmsCaptureContext";
 import { usePageData } from "../components/GeneratedTiles";
-import { buildSmsBrain, resolveGreeting } from "../data/smsBrain";
+import { useAiAssistant } from "../data/AiAssistantContext";
+import { buildSmsBrain, resolveGreeting, smsWorkflowScopePath, SMS_WORKFLOW_SCOPE_PATH, type SmsWorkflowAgent } from "../data/smsBrain";
+import { tollFreeNumber } from "../data/smsContactNumber";
+import { smsWorkflowFlow } from "../data/workflowDrawers";
+import { smsConfigFor, type SmsConfig } from "../data/smsTemplate";
 import { QUESTIONS_PATH } from "../data/questionImport";
 import type { SmsConversation, SmsTurn } from "../data/schema";
+import { useAutoGrow } from "../data/useAutoGrow";
+import { useExtraWorkflows, quoteForWorkflow, lsaLeadMessage } from "../data/quoteWorkflow";
+import { useQuoteCaptures } from "../data/QuoteCaptureContext";
 
 /* iPhone "Preview Agent" chat — modern iOS (dark mode) Messages mockup. The SE
    role-plays a customer texting in; the SMS agent replies live via /api/chat
@@ -15,6 +22,8 @@ import type { SmsConversation, SmsTurn } from "../data/schema";
    to the AI SMS Conversation Intelligence report — the demo's headline move. */
 
 interface Msg { role: "user" | "assistant"; content: string; }
+
+
 
 /* ---- capture helpers (client-side; Date/Math.random are fine here) -------- */
 const HEX = "0123456789ABCDEF";
@@ -45,13 +54,24 @@ function newConvBase(): ConvBase {
   return { id: genId(), now: new Date(), callerId: `805-555-${String(1000 + Math.floor(Math.random() * 9000)).slice(0, 4)}` };
 }
 
-function buildConversation(messages: Msg[], base: ConvBase): SmsConversation {
+/* ⚠️⚠️ **`leadIn` IS IN THE REPORT AND NEVER ON THE PHONE, which is the whole point of passing
+   it here rather than seeding it into `messages`.** Google's LSA lead payload arrives on the
+   business's inbound channel, so the Interactions report shows it as the consumer's first
+   message — but the consumer never sees it, and putting a notification about themselves into
+   the iPhone mockup would break the one screen that has to stay a believable iMessage thread.
+   The phone renders `messages`; the capture renders this in front of them. See
+   `lsaLeadMessage`. */
+function buildConversation(messages: Msg[], base: ConvBase, leadIn?: string): SmsConversation {
   const { id, now, callerId } = base;
-  const transcript: SmsTurn[] = messages.map((m, i) => ({
+  const turns: SmsTurn[] = messages.map((m, i) => ({
     speaker: m.role === "assistant" ? "agent" : "consumer",
-    time: clock(new Date(now.getTime() + i * 60000)),
+    /* +1 when there is a lead-in, so its own timestamp stays the earliest in the thread. */
+    time: clock(new Date(now.getTime() + (i + (leadIn ? 1 : 0)) * 60000)),
     text: m.content,
   }));
+  const transcript: SmsTurn[] = leadIn
+    ? [{ speaker: "consumer", time: clock(now), text: leadIn }, ...turns]
+    : turns;
   const nm = extractName(messages);
   return {
     id,
@@ -60,11 +80,18 @@ function buildConversation(messages: Msg[], base: ConvBase): SmsConversation {
     date: longDate(now),
     transcript,
     signals: [],
+    /* ⚠️ The lead-in is only ever built from a submitted quote request, so its presence IS
+       the marker — see `SmsConversation.lsa`. Absent (not `false`) otherwise, so a normal
+       capture is byte-identical to what it was before this field existed. */
+    ...(leadIn ? { lsa: true as const } : {}),
     smsInfo: {
       callRecordId: id,
       smsStartTime: startTime(now),
       destinationPhone: "877-936-2933",
-      totalMessages: String(messages.length),
+      /* ⚠️ THE TRANSCRIPT'S LENGTH, NOT `messages`' — with an LSA lead-in the two differ, and
+         an SMS Info card that disagrees with the transcript beside it is the kind of thing a
+         prospect notices before we do. */
+      totalMessages: String(transcript.length),
       source: "877-936-2933",
       promoNumberDescription: "SMS",
       smsEngaged: "Yes",
@@ -125,7 +152,11 @@ function BatteryIcon() {
    changes what the phone asks on the next message rather than being a note in a
    drawer. `title` gives the drawer a real scope label (agentConfig has none). */
 function useBrain(wfSlug?: string | null) {
-  const { profile } = useProfile();
+  const { profile, profileId } = useProfile();
+  /* Includes any workflow created by an LSA quote request submitted during this demo,
+     newest first — one definition, so a slug that lists here also resolves elsewhere. */
+  const extraWfs = useExtraWorkflows(profile);
+  const { effectiveData } = useAiAssistant();
   const base = useMemo(() => ({
     title: `Preview Agent — what the ${profile.customerName} SMS agent asks`,
     ...(profile.reports.agentConfig ?? {}),
@@ -134,21 +165,97 @@ function useBrain(wfSlug?: string | null) {
      what the agent asks, so it is the one place the paste / import / use-case
      controls belong. */
   const wf = wfSlug
-    ? (profile.reports.extraWorkflows ?? []).find((w) => w.slug === wfSlug)
+    ? extraWfs.find((w) => w.slug === wfSlug)
     : undefined;
+  /* ⚠️⚠️ **THE WORKFLOW PAGE'S OWN `agent` HALF, READ BACK ACROSS A TAB BOUNDARY (9/8/2026).**
+     Ask AI on an SMS extra workflow page now configures that workflow's opener and its ordered
+     flow (see `smsWorkflowAgentOf`), and Preview Agent opens in a SEPARATE TAB. Without this
+     read the edit would live in a scope nothing here consults, and the phone would keep
+     greeting with the authored line while the drawer reported success — the same cross-surface
+     no-op fixed on 9/3, one page over.
+
+     ⚠️ **`effectiveData` REGISTERS NOTHING**, so this cannot repoint this page's own scope (its
+     sparkle still edits the agent's questions). Overrides are persisted to localStorage, which
+     is what makes a value written in the other tab visible here at all; an UNEDITED workflow
+     has no such key, `effectiveData` returns undefined, and `buildSmsBrain` falls back to the
+     authored `openingMessage` and `playbookSteps` exactly as before. */
+  const wfAgent = wf
+    ? ((effectiveData(`${profileId}::${smsWorkflowScopePath(wf.slug)}`) as
+        { agent?: SmsWorkflowAgent } | undefined)?.agent ?? null)
+    : null;
   /* ⚠️ TELL THE DRAWER WHAT THIS AGENT ACTUALLY OPENS WITH. Without it the drawer falls back
      to a DERIVED default and shows an opening message this workflow never sends — which is
      what let Ask AI report a change to a line nobody would hear. Passed as scope metadata
      rather than folded into `base`, because the agent scope key is shared by every Preview
-     Agent regardless of `?wf=` and seeding it would leak this opener into the others. */
-  const ac = usePageData(base, { questionPath: QUESTIONS_PATH, greetingFallback: wf?.openingMessage });
+     Agent regardless of `?wf=` and seeding it would leak this opener into the others.
+
+     ⚠️⚠️ **IT IS THE EFFECTIVE OPENER, NOT THE AUTHORED ONE, AND THE FIRST BUILD OF THIS GOT
+     IT WRONG (9/8/2026).** Caught in the browser, not by a type: with the opener edited on the
+     workflow page, the phone's first bubble read "Hi Michael, Orlando Health here…" while this
+     drawer's OPENING MESSAGE row still showed "Hi Michael, this is Orlando Health…" — the
+     drawer displaying a line the agent does not send, which is defect 3 of the 9/3 report
+     reappearing through a new door. `wfAgent.greeting` is what `buildSmsBrain` resolves, so it
+     is what the row has to show. */
+  const ac = usePageData(base, {
+    questionPath: QUESTIONS_PATH,
+    /**
+     * ⚠️⚠️ **ASK AI HERE CAN EDIT THE WORKFLOW ITSELF (9/17/2026), which is the other half of
+     * "make the config bi directional".** Its edits land on the workflow's OWN scope, so they
+     * redraw the diagram rather than storing a second copy of a question here.
+     *
+     * ⚠️ **THE TEXT FIELDS ONLY, DELIBERATELY NARROWER THAN THE TREE.** `sms` carries every
+     * question, fallback, instruction and intent — so "ask about termites first" reaches the
+     * node an SE would have typed it into. `branches` is NOT exposed: handing a second page
+     * structural control of the tree means the model can change its DEPTH, and the six-row
+     * geometry has no row to draw a seventh in, so nodes would be stored and never rendered —
+     * the silent no-op this file keeps recording. Restructuring stays on the workflow page,
+     * where the diagram is on screen while you do it.
+     * ⚠️ Built-in workflow only: an extra workflow has no `sms` config of its own.
+     */
+    ...(!wf ? { linkKey: `${profileId}::${SMS_WORKFLOW_SCOPE_PATH}`, linkAs: "workflow" } : {}),
+    greetingFallback: wfAgent?.greeting ?? wf?.openingMessage,
+    /* ⚠️ An LSA quote workflow's opener beats a stored greeting on the phone, so it has to
+       beat it in the drawer's row too — see `Scope.greetingWins`. */
+    greetingWins: !!wf?.openingMessageWins,
+  });
   /* Shape comes from data/smsBrain.ts, shared with the SMS workflow page's
      "Preview Workflow" chat drawer. Both are previews of ONE agent, so they must
      ask the same questions in the same order; two local copies of this object
      would drift on the first edit. What differs is only HOW each screen obtains
      the config — this one registers an AI scope (it is the page whose drawer edits
      the questions), the workflow drawer must not. See smsBrain.ts. */
-  return buildSmsBrain(profile, ac, wf);
+  /**
+   * ⚠️⚠️ **THE BUILT-IN WORKFLOW'S OWN CONFIG, READ THE SAME CROSS-PAGE WAY `wfAgent` IS
+   * (9/17/2026).** Asked for directly: "if there are changes in the workflow, it also changes it
+   * in actual preview agent or preview workflow." The mechanism was already here — this page has
+   * read an EXTRA workflow's scope since 9/8 — and the built-in one simply was not being read,
+   * so the whole six-row template was invisible to the phone.
+   *
+   * ⚠️ `effectiveData` REGISTERS NOTHING, so this cannot repoint this page's own scope; the
+   * sparkle here still edits the agent's own fields. An unedited workflow has no override key
+   * and this resolves to the template's base, which is what makes an edit — from Ask AI or from
+   * a drawer — take effect the moment it lands, in either direction.
+   * ⚠️ ONLY FOR THE BUILT-IN WORKFLOW (`!wf`): an extra workflow states its own flow in
+   * `systemPrompt`/`playbookSteps`, and sending both would be two flows for one conversation.
+   */
+  const wfTree = !wf
+    ? (effectiveData(`${profileId}::${SMS_WORKFLOW_SCOPE_PATH}`) as
+        { branches?: unknown[]; sms?: unknown } | undefined)
+    : undefined;
+  const flow = useMemo(() => {
+    if (!wfTree?.branches?.length) return null;
+    const cfg = { ...smsConfigFor(profile), ...((wfTree.sms as object) ?? {}) } as SmsConfig;
+    try {
+      return smsWorkflowFlow(profile, wfTree as never, cfg);
+    } catch {
+      /* ⚠️ A STORED TREE FROM AN OLDER SHAPE MUST NOT TAKE THE PHONE DOWN. The agent falling
+         back to its generated flow is a degraded demo; a thrown error inside `useBrain` is a
+         blank preview, and this reads a scope another page owns. */
+      return null;
+    }
+  }, [profile, wfTree]);
+
+  return buildSmsBrain(profile, ac, wf, wfAgent, flow);
 }
 
 /* mode "modal" = the in-app overlay (legacy); mode "page" = a standalone browser
@@ -162,11 +269,22 @@ export function PhonePreview({ onClose, mode = "modal", wf }: {
   const { profile } = useProfile();
   const { upsertCaptured, patchCaptured } = useSmsCapture();
   const brain = useBrain(wf);
+  /* An LSA quote workflow's thread opens with the payload Google posted to the business —
+     see `lsaLeadMessage`. Undefined for every other workflow and for the built-in agent, so
+     nothing else's capture changes shape.
+     ⚠️ THE HOOK IS CALLED UNCONDITIONALLY and the slug is tested afterwards; `wf &&
+     quoteForWorkflow(...)` around the hook call would make it conditional, which React
+     forbids and which would break the moment the SE opened a different preview. */
+  const quotes = useQuoteCaptures().capturedFor(profile.id);
+  const quote = wf ? quoteForWorkflow(wf, quotes) : undefined;
+  const leadIn = quote ? lsaLeadMessage(quote) : undefined;
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const inputRef = useRef<HTMLTextAreaElement>(null);
+  useAutoGrow(inputRef, input);
   const started = useRef(false);
   const baseRef = useRef<ConvBase | null>(null);
   const analyzeTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -291,7 +409,7 @@ export function PhonePreview({ onClose, mode = "modal", wf }: {
   useEffect(() => {
     if (!messages.some((m) => m.role === "user")) return;
     if (!baseRef.current) baseRef.current = newConvBase();
-    const conv = buildConversation(messages, baseRef.current);
+    const conv = buildConversation(messages, baseRef.current, leadIn);
     upsertCaptured(profile.id, conv);
 
     if (analyzeTimer.current) clearTimeout(analyzeTimer.current);
@@ -339,7 +457,7 @@ export function PhonePreview({ onClose, mode = "modal", wf }: {
               <button className="sms-navbtn sms-back" aria-label="Back"><span className="material-icons">arrow_back_ios_new</span></button>
               <div className="sms-contact">
                 <div className="sms-avatar"><span className="material-icons">person</span></div>
-                <div className="sms-namepill">{profile.customerName}<span className="material-icons">chevron_right</span></div>
+                <div className="sms-namepill">{tollFreeNumber(profile.id)}<span className="material-icons">chevron_right</span></div>
               </div>
               <span className="sms-navspacer" aria-hidden="true" />
             </div>
@@ -356,13 +474,19 @@ export function PhonePreview({ onClose, mode = "modal", wf }: {
             <div className="sms-inputbar">
               <button className="sms-plus" aria-label="Attach"><span className="material-icons">add</span></button>
               <div className="sms-field">
-                <input
+                <textarea
+                  ref={inputRef}
                   className="sms-input"
                   placeholder="Text Message · SMS"
                   value={input}
+                  rows={1}
                   autoFocus
                   onChange={(e) => setInput(e.target.value)}
-                  onKeyDown={(e) => { if (e.key === "Enter") send(); }}
+                  /* An `<input>` had no way to grow at all, so the field can only
+                     grow by becoming a textarea — but a real iMessage compose box
+                     still sends on plain Return rather than inserting a line
+                     break, so Enter is prevented here and forwarded to send(). */
+                  onKeyDown={(e) => { if (e.key === "Enter") { e.preventDefault(); send(); } }}
                 />
                 {hasText ? (
                   <button className="sms-send" onClick={send} disabled={busy} aria-label="Send"><span className="material-icons">arrow_upward</span></button>

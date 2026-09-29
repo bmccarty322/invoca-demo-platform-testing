@@ -75,7 +75,20 @@ const LENGTH_IS_CONTENT = [
      ⚠️ SCOPED TO `agent.` ON PURPOSE. A bare /rules$/ would also match the Signal Manager's
      rule strings and any other `rules` array on any screen, quietly widening rule 2 across the
      app to buy one page a feature. */
-  /^agent\.(rules|informSteps|serviceZips)$/i,
+  /* ⚠️ `steps` IS THE SMS SIDE OF `informSteps` (9/8/2026), registered beside an extra
+     workflow's diagram so its Ask AI matches the voice page's. Same reason it is a length
+     exemption: "drop the step that asks for the reason" and "add a step that confirms the
+     facility" are the whole feature, and a fixed length leaves it able to reword a step and
+     unable to add one. Still scoped to `agent.` — a bare /steps$/ would widen rule 2 across
+     any other screen that happens to hold a `steps` array. */
+  /* ⚠️ `supportRules` JOINED THEM 9/21/2026, when the Need Support intent drawer stopped
+     being read-only. Its list starts EMPTY on every prospect, so "add a rule" there is both
+     an undefined -> array write (covered below) and a length change. */
+  /^agent\.(rules|supportRules|informSteps|serviceZips|steps)$/i,
+  /* ⚠️ SCOPED TO `sms.` FOR THE SAME REASON `agent.` IS. The built-in SMS workflow's Intent
+     Details drawer adds and removes conversation rules, so that list's length IS its content —
+     but a bare /rules$/ would widen rule 2 across every other screen carrying a `rules` array. */
+  /^sms\.intents\.(sales|support)\.rules$/i,
   /* THE DIGITAL JOURNEY REPORT'S LEADING COLUMNS. Adding, removing, renaming or
      moving one is a normal thing to want of a demo table ("put a Location column
      before Marketing Source"), and it used to be declined as structural.
@@ -136,6 +149,10 @@ const LENGTH_IS_CONTENT = [
    allowing arbitrary key creation is how the assistant starts inventing fields the
    renderer never reads. */
 const CREATABLE_WHEN_ABSENT = [
+  /* ⚠️ THE FIRST TEXT AN SE TYPES INTO AN ADDED SEGMENT. These keys do not exist until one is
+     written, so every first write is `undefined -> string`. Flat on `sms` rather than nested,
+     because `setByPath` will not create a missing intermediate — see the note in smsTemplate. */
+  /^sms\.extra__[A-Za-z0-9_-]+$/,
   /\bgreeting$/i,
   /* A prospect with no configured service area has NEITHER of these, so the first "only serve
      ZIPs 30097 and 30096" is an undefined -> value write. `agentConfigOf` omits them rather
@@ -154,6 +171,24 @@ const CREATABLE_WHEN_ABSENT = [
      Safe to allow because `specWithConfig` validates the value against VOICE_OPTIONS:
      the guard decides whether a write is structural, not whether it is a real voice. */
   /^agent\.voice$/i,
+  /* ⚠️ THE VOICE DRAWERS' PER-NODE FIELDS (9/21/2026) — a use case's own instruction, its
+     transfer number and its signal. Flat on `agent` for the reason the SMS ones are flat on
+     `sms`: `setByPath` refuses a path whose INTERMEDIATE key is missing and only ever creates
+     the last segment, so anything nested would be dropped SILENTLY on every demo whose stored
+     override does not already reach it. None of these keys exists until an SE types in that
+     node, so every first write is `undefined -> string`. */
+  /^agent\.extra__[A-Za-z0-9_-]+$/,
+  /* ⚠️ THE SUPPORT INTENT'S OWN COPY, which no prospect carries: it was hardcoded in
+     `workflowDrawers.ts` until its drawer became editable, so the first edit creates it. */
+  /^agent\.(supportIntent|supportRules)$/i,
+  /* ⚠️ **THE REPLICA'S "AFTER SUBMIT" PAGE.** It shares one stored object with the booking
+     link, and a demo that saved a booking link BEFORE this field existed has an override of
+     `{ bookingUrl }` alone — so the first thank-you write on exactly those demos is an
+     undefined -> string flip and would be refused, i.e. the field would work on a fresh demo
+     and silently fail on the ones most likely to have been set up already. Same trap the
+     greeting, `serviceZips` and the voice picker each had to be let through by name. The value
+     is validated by `normalizeUrl` before it ever reaches here. */
+  /^thankYouUrl$/i,
 ];
 
 /**
@@ -236,6 +271,30 @@ export function isLockedEdit(data: unknown, path: string): boolean {
   if (!m) return false;
   const parent = getByPath(data, path.slice(0, path.length - m[0].length));
   return !!parent && typeof parent === "object" && (parent as { locked?: unknown }).locked === true;
+}
+
+/**
+ * Split one batch of edits between the page's own scope and a LINKED one.
+ *
+ * ⚠️⚠️ **THE PREFIX DECIDES WHICH SCOPE OWNS THE FIELD, and getting it wrong stores a second
+ * copy.** The Preview Agent's Ask AI can edit the SMS workflow (9/17/2026); left on the page's
+ * own key, a `workflow.…` path would be saved in the PREVIEW's scope — a duplicate of a
+ * question the diagram draws from elsewhere, which is the duplicated-field trap behind all
+ * three of the 8/27 voice bugs. Stripped and routed, the edit lands on the one owner.
+ *
+ * ⚠️ PURE AND EXPORTED so the audit can call it with real inputs. It lived inline in the
+ * drawer first, where the only possible check was "does a router exist" — which passed against
+ * a router that had been made to route nothing.
+ */
+export function routeEdits<T extends { path: string }>(edits: T[], linkAs?: string):
+  { mine: T[]; theirs: T[] } {
+  if (!linkAs) return { mine: edits, theirs: [] };
+  const pre = `${linkAs}.`;
+  return {
+    mine: edits.filter((e) => !e.path.startsWith(pre)),
+    theirs: edits.filter((e) => e.path.startsWith(pre))
+      .map((e) => ({ ...e, path: e.path.slice(pre.length) })),
+  };
 }
 
 /* =============================================================================

@@ -15,6 +15,9 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import type {
   LocalAudioTrack, Participant, RemoteTrack, Room, RoomEvent, Track, TranscriptionSegment,
 } from "livekit-client";
+/* ⚠️ A VALUE import, not type-only: the watchdog's give-up path reports itself. Tiny
+   and has no dependencies of its own, so it costs the eager bundle nothing measurable. */
+import { reportClientError } from "./clientErrors";
 
 /* =============================================================================
    liveKitVoice.ts — the streaming engine behind the live Voice-agent call
@@ -196,6 +199,44 @@ function destroyLive() {
   c.room.disconnect().catch(() => {});
 }
 
+/**
+ * Fetch the `livekit-client` chunk BEFORE the SE clicks Start Call.
+ *
+ * ⚠️⚠️ **THIS DOES NOT UNDO THE LAZY IMPORT — it moves WHEN the chunk is fetched, not whether
+ * it ships separately.** The measurement at the top of this file still holds: importing
+ * `livekit-client` at module scope put the single bundle from 2,166,613 to 2,661,260 bytes
+ * (+124 KB gzipped) on EVERY screen, for a library only the voice call touches. Preloading
+ * keeps it a separate chunk and out of that bundle; it simply starts the download when the
+ * preview drawer opens rather than on the click that starts the call.
+ *
+ * ⚠️ **OPENING THE DRAWER IS THE SIGNAL, and it is a reliable one** — the drawer's only
+ * content is "Start a live test call", so an SE who opened it is about to call.
+ *
+ * ⚠️⚠️ **BE HONEST ABOUT THE SIZE OF THIS WIN: IT IS ~0.2s, ON THE FIRST CALL ONLY.** Measured
+ * on production 9/15/2026. The chunk is 493,428 bytes and fetches cold in **130-322ms**; on a
+ * warm cache it costs **1ms**, so after the first call of a session this saves nothing. The
+ * click-to-agent-speaking total was **4.5s**, of which the chunk was 1ms (cached) and minting
+ * the token 67ms — **the remaining ~4s is inside `room.connect()` plus LiveKit creating the
+ * room and dispatching the agent**, which is not ours to shorten. So this is worth keeping
+ * (it takes half a megabyte off the critical path of the first call after every deploy, which
+ * is exactly the call an SE makes when they open a demo) and it is NOT the reason a call takes
+ * four seconds. Do not cite it as one.
+ *
+ * ⚠️ **IT MUST NOT PRE-MINT A TOKEN, and that is a deliberate line.** `/api/livekit-token`
+ * CREATES the room, and LiveKit dispatches the agent at room creation — so warming that
+ * instead would launch an agent before the SE clicked, spend inference minutes and a
+ * concurrency slot, and leave a zombie room behind if they never called. Only the chunk is
+ * warmed here; nothing reaches LiveKit.
+ *
+ * Idempotent and fire-and-forget. The rejection is swallowed because a failed preload must
+ * not surface anywhere: `connect()` awaits the same import and reports the failure there,
+ * where there is a call to fail.
+ */
+let enginePreload: Promise<unknown> | null = null;
+export function preloadVoiceEngine(): void {
+  enginePreload ??= import("livekit-client").catch(() => null);
+}
+
 export function useLiveKitVoice(): LiveKitVoice {
   const [phase, setPhase] = useState<VoicePhase>("idle");
   const [turns, setTurns] = useState<VoiceTurn[]>([]);
@@ -302,18 +343,36 @@ export function useLiveKitVoice(): LiveKitVoice {
       const call: LiveCall = { room, audioEl: null, meter: null };
       bind(call, RoomEvent, Track);
 
-      /* ⚠️ `room.connect()` RETRIES INTERNALLY AND CAN HANG INDEFINITELY, which on a
-         projector is worse than failing — observed as "Connecting…" forever with no error.
-         12s is generous for a healthy network and short enough that nobody is left guessing. */
-      await Promise.race([
-        room.connect(data.url, data.token),
-        new Promise((_, rej) => setTimeout(
-          () => rej(new Error("Could not reach the voice service. End the call and try again.")),
-          CONNECT_TIMEOUT_MS,
-        )),
-      ]);
-      await room.localParticipant.setMicrophoneEnabled(true);
-      call.meter = startMeter(room);
+      /* ⚠️⚠️ **EVERY FAILURE PAST THIS POINT MUST DISCONNECT THE ROOM ITSELF, AND NOT DOING SO
+         WAS A REAL LEAK (9/15/2026).** `live` is assigned only once the call is fully up, and
+         `destroyLive()` early-returns while it is null — so anything that threw AFTER
+         `room.connect()` had resolved left a CONNECTED room that nothing could ever hang up.
+         Measured in the Browser pane, which has no microphone: `setMicrophoneEnabled(true)`
+         threw "Permission denied", the outer catch called `destroyLive()`, that found
+         `live === null` and returned, and the caller stayed in the room as ACTIVE indefinitely.
+         End Call could not release it, and because LiveKit caps CONCURRENT inference
+         connections per plan it held a slot until somebody deleted the room by hand.
+         ⚠️ The timeout race has the SAME shape and is covered by the same catch: it rejects
+         while `room.connect()` is still in flight, so the room can come up moments later with
+         nobody holding a reference to it. `disconnect()` is safe on a room that never
+         connected, which is why this needs no flag tracking whether it did. */
+      try {
+        /* ⚠️ `room.connect()` RETRIES INTERNALLY AND CAN HANG INDEFINITELY, which on a
+           projector is worse than failing — observed as "Connecting…" forever with no error.
+           12s is generous for a healthy network and short enough that nobody is left guessing. */
+        await Promise.race([
+          room.connect(data.url, data.token),
+          new Promise((_, rej) => setTimeout(
+            () => rej(new Error("Could not reach the voice service. End the call and try again.")),
+            CONNECT_TIMEOUT_MS,
+          )),
+        ]);
+        await room.localParticipant.setMicrophoneEnabled(true);
+        call.meter = startMeter(room);
+      } catch (e) {
+        room.disconnect().catch(() => {});
+        throw e;
+      }
       live = call;
 
       /* If the agent is already here, nothing to wait for. */
@@ -348,6 +407,23 @@ export function useLiveKitVoice(): LiveKitVoice {
             if (agentGrace) { clearInterval(agentGrace); agentGrace = null; }
             noticeSink?.(null);
             errorSink?.("The voice agent did not join in time. It should be warm now, so end the call and start it again. If it fails a second time, the voice worker may actually be down.");
+            /* ⚠️⚠️ **THIS IS THE VOICE HEALTH CHECK, and it is the honest one.**
+               `/api/status`'s `livekitConfigured` only proves the three keys exist; it
+               says nothing about whether a worker is REGISTERED under this
+               environment's agent name, and the worker ships by `lk agent deploy`
+               rather than `git push`, so a stale or missing one is invisible from
+               here. LiveKit's server SDK exposes no worker registry to ask, and
+               guessing at one would be a check that cannot be verified.
+               What IS ground truth is this moment: 30 seconds elapsed and nothing
+               joined the room. Every documented cold start is over by then, so this
+               is either a genuinely dead worker or a wake-up far outside LiveKit's
+               own stated window — both worth being told about. Reported through the
+               SAME client reporter as a render error, so it needs no new endpoint. */
+            reportClientError({
+              where: "voice-agent-missing",
+              name: "AgentNeverJoined",
+              message: `No agent joined within ${(AGENT_JOIN_TIMEOUT_MS + AGENT_GRACE_MS) / 1000}s`,
+            });
           };
           /* ⚠️ THE INTERVAL IS ARMED BEFORE THE FIRST TICK, NOT AFTER. `tick` can finish the
              countdown on its very first run (the agent landed, or the clock is already spent),

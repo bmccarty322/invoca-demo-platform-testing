@@ -3,11 +3,12 @@ import { useLocation } from "react-router-dom";
 import { useProfile } from "../data/ProfileContext";
 import { useAiAssistant } from "../data/AiAssistantContext";
 import { columnEdits } from "../data/columnEdits";
-import { getByPath , constrainToFocus } from "../data/editGuard";
+import { getByPath , constrainToFocus, routeEdits } from "../data/editGuard";
 import { QuestionListTools } from "./QuestionListTools";
 import { stripGeneratedDashes, GREETING_PATH } from "../data/questionImport";
 import { defaultGreeting, resolveGreeting } from "../data/smsBrain";
 import { findTilePath } from "../data/findTilePath";
+import { useAutoGrow } from "../data/useAutoGrow";
 import { tileId } from "../data/tileId";
 
 /* The "Ask AI" drawer: slides in from the right over a dimmed backdrop. Scope is
@@ -41,6 +42,12 @@ interface Msg { role: "user" | "assistant"; content: string; icon?: string }
    ============================================================================= */
 type TreeShape = {
   agent?: unknown;
+  /* ⚠️ THE CHANNEL, so the hint below does not offer a VOICE agent on an SMS page. Read from
+     the tree model's own `variant` rather than sniffed from the data: an SMS extra workflow
+     registers an `agent` half too now, and without this its empty state read "Build Orlando
+     Health's voice agent" and suggested opening with "Thanks for calling" on a screen whose
+     whole subject is text messages. */
+  variant?: string;
   branches?: { title?: string; leaves?: { title?: string; paths?: { title?: string }[] }[] }[];
 };
 
@@ -75,6 +82,36 @@ function pageHint(data: unknown, customerName: string): { title: string; body: R
   const titles = branchTitles(d);
   const last = titles[titles.length - 1];
 
+  /* ⚠️⚠️ **AN SMS WORKFLOW'S AGENT HALF IS A DIFFERENT OFFER (9/8/2026).** It configures the
+     workflow's opening TEXT MESSAGE and its ordered flow, not a voice, a spoken greeting or a
+     ZIP gate. Sharing the voice copy here would promise edits this page cannot make and word
+     them for a phone call. The two branches diverge only in the offer; the tree examples below
+     are derived the same way in both, off the branches the SE is actually looking at. */
+  if (d?.agent && d?.variant === "sms") {
+    const steps = (d.agent as { steps?: unknown }).steps;
+    const ex: string[] = [];
+    if (last) ex.push(`remove the ${last} branch`);
+    ex.push(`add a use case under All Support Users`);
+    if (titles[0] && titles[0] !== last) ex.push(`ask ${titles[0]} for their email as well`);
+    /* Offered only when this workflow states its flow as a list. A workflow whose flow lives
+       in its playbook prose has no `steps` to edit, and suggesting one would be an
+       instruction that quietly does nothing. */
+    if (Array.isArray(steps) && steps.length) ex.push(`add a step before the hand-off`);
+    ex.push(`open with Hi {name}, this is ${customerName}`);
+    return {
+      title: `Build ${possessive(customerName)} SMS agent`,
+      body: (
+        <>
+          Describe what you want the agent to do and I&apos;ll build the tree and configure it:
+          {" "}{ex.map((e, i) => (
+            <span key={e}>{i ? ", " : ""}&quot;{e}&quot;</span>
+          ))}.
+          {" "}The trigger, Conversation Start and the four nodes above the branches are
+          Invoca&apos;s own and cannot be renamed.
+        </>
+      ),
+    };
+  }
   if (d?.agent) {
     /* ⚠️ **BUILT AS A LIST SO NO BRANCH IS NAMED TWICE.** With fixed slots, Comfort Keepers'
        two branches put "Interested in becoming a caregiver" in both the remove example and the
@@ -153,14 +190,17 @@ export function AiAssistantDrawer() {
   const [messages, setMessages] = useState<Msg[]>([]);
   const [input, setInput] = useState("");
   const [busy, setBusy] = useState(false);
-  /* ⚠️ THE PROGRESS BAR EXISTS BECAUSE ONE PAGE IS DELIBERATELY SLOW (9/3/2026). The voice
-     workflow's answer runs on Opus with adaptive thinking, which takes real seconds — asked
-     for explicitly: "It's ok if it takes a bit like it does for you, just put the progress
-     bar or a percentage." Absent on every other page, which still answers in one hop on
-     Haiku and gets the three-dot indicator as before. */
+  /* ⚠️ EVERY PAGE IS DELIBERATELY SLOW NOW (9/3/2026, widened 9/11/2026). Ask AI runs on
+     Opus with adaptive thinking everywhere, which takes real seconds — first asked for on
+     the voice workflow explicitly: "It's ok if it takes a bit like it does for you, just
+     put the progress bar or a percentage," then extended platform-wide so every surface
+     gets the same treatment rather than a fast/slow split whose failure mode was silent
+     partial answers. The three-dot indicator only shows before the first progress event
+     arrives. */
   const [prog, setProg] = useState<{ phase: string; pct: number; note?: string } | null>(null);
   const [error, setError] = useState("");
   const inputRef = useRef<HTMLTextAreaElement>(null);
+  useAutoGrow(inputRef, input);
   const listRef = useRef<HTMLDivElement>(null);
   const key = active?.key ?? "";
 
@@ -202,7 +242,12 @@ export function AiAssistantDrawer() {
        Preview Agent opened for such a workflow the row therefore showed a DERIVED default the
        agent never sends, and the prompt handed the model that same wrong text as the current
        opening message. Now the three terms match the phone's, in the same order. */
-    const raw = (getByPath(data, GREETING_PATH) as string)
+    /* ⚠️ THE ORDER MIRRORS `buildSmsBrain`'s, INCLUDING ITS ONE JUMP-THE-QUEUE CASE. A
+       workflow that sets `openingMessageWins` (today: one generated from a live LSA quote
+       request) outranks a stored `smsPlaybook.greeting` on the phone, so it must here as well,
+       or this row shows a line the agent does not send. */
+    const raw = (active.greetingWins ? active.greetingFallback : "")
+      || (getByPath(data, GREETING_PATH) as string)
       || active.greetingFallback
       || defaultGreeting(active.customerName, data?.smsPlaybook);
     return { raw, display: resolveGreeting(raw, profile) };
@@ -229,6 +274,22 @@ export function AiAssistantDrawer() {
   async function send() {
     const q = input.trim();
     if (!q || busy || !active) return;
+    /**
+     * Apply a batch that may target TWO scopes.
+     *
+     * ⚠️⚠️ **THE PREFIX IS STRIPPED AND THE EDIT GOES TO THE SCOPE THAT OWNS THE FIELD.** Left
+     * on `active.key`, a `workflow.…` path would be stored in the Preview Agent's own scope —
+     * a second copy of a question the diagram draws from somewhere else, which is the
+     * duplicated-field trap this repo has paid for three times. Routed, the edit lands on the
+     * workflow's scope and the diagram redraws from the one value.
+     * ⚠️ Returns the TOTAL applied, so the drawer's "I made N changes" stays true across both.
+     */
+    const applyEditsRouted = (edits: { path: string; value: string }[]): number => {
+      const { mine, theirs } = routeEdits(edits, active.linkAs);
+      let n = mine.length ? applyEdits(active.key, mine) : 0;
+      if (theirs.length && active.linkKey) n += applyEdits(active.linkKey, theirs);
+      return n;
+    };
     setInput(""); setError("");
     const history = messages.map((m) => ({ role: m.role, content: m.content }));
     setMessages((prev) => [...prev, { role: "user", content: q }]);
@@ -257,10 +318,47 @@ export function AiAssistantDrawer() {
         if (!playbook.greeting) playbook.greeting = greeting.raw;
         eff = { ...cur, smsPlaybook: playbook };
       }
+      /* ⚠️⚠️ SHOW THE MODEL THE WORKFLOW IT CAN SEE ON THE OTHER TAB, under its own prefix.
+         Same reasoning as the greeting fold directly above — "if a value is on screen but not
+         in `dataContext`, the model will write it somewhere else" — but here the value belongs
+         to ANOTHER scope, so the prefix is what lets the edits be routed back to it rather than
+         stored as a second copy in this page's scope. */
+      if (active.linkKey && active.linkAs) {
+        const linked = effectiveData(active.linkKey);
+        if (linked && typeof linked === "object") {
+          eff = { ...(eff as object), [active.linkAs]: linked };
+        }
+      }
+      /**
+       * ⚠️⚠️ **THE 12,000-CHAR CAP SILENTLY ATE THE WORKFLOW, AND A SLICED JSON IS MALFORMED
+       * JSON (9/17/2026).** Caught in the browser the first time Ask AI was asked to change a
+       * workflow question: the payload came out at exactly 12,012 characters — the cap plus the
+       * marker — so the `workflow` half, appended last, was cut off entirely and the model was
+       * handed an unterminated object. It could not have edited what it could not see.
+       *
+       * ⚠️ RAISED TO 40k, WHICH IS STILL SMALL. Every request runs the director model (Opus,
+       * streamed); Aptive's agent config alone is ~12KB of prose, so 12k was already clipping
+       * pages before anything was folded in. The cap exists to bound cost, not to fit a shape.
+       * ⚠️ AND IT DEGRADES BY DROPPING THE LINKED HALF FIRST, so what remains is always VALID
+       * JSON describing this page's own data — a page whose context is malformed is worse than
+       * one that is merely missing an optional section, because the model then misreads
+       * everything rather than one field.
+       */
       let dataContext = "";
-      try { const j = JSON.stringify(eff); dataContext = j.length > 12000 ? j.slice(0, 12000) + "…(truncated)" : j; } catch { /* ignore */ }
-      /* The server decides the model from the same signal; this only decides the transport. */
-      const wantsStream = /"agent"\s*:/.test(dataContext);
+      const CAP = 40000;
+      try {
+        let j = JSON.stringify(eff);
+        if (j.length > CAP && active.linkAs && eff && typeof eff === "object") {
+          const { [active.linkAs]: _dropped, ...own } = eff as Record<string, unknown>;
+          j = JSON.stringify(own);
+        }
+        dataContext = j.length > CAP ? j.slice(0, CAP) + "…(truncated)" : j;
+      } catch { /* ignore */ }
+      /* ⚠️ ALWAYS STREAMS NOW (9/11/2026) — every "Ask AI" request runs the same director
+         model (engine/assistant.ts), which is streamed unconditionally on the server. This
+         used to test the page's data shape (`/"agent"\s*:/`) to match a Haiku/Opus split that
+         no longer exists; every page gets the same progress bar now. */
+      const wantsStream = true;
       const res = await fetch("/api/ai-assistant", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -277,9 +375,8 @@ export function AiAssistantDrawer() {
              variant, so a tile created there is actually drawn. */
           canCreateTiles: pathname.startsWith("/dashboards/") || pathname.startsWith("/reports/")
             || pathname.startsWith("/insights/"),
-          /* ⚠️ THE SAME TEST THE SERVER USES TO PICK THE MODEL — the page's DATA carrying an
-             `agent` key, not its pathname. Asking for the stream on a page the server will
-             answer on Haiku would show a progress bar for a request that has no phases. */
+          /* Always true now — see wantsStream above. Every request runs the director model
+             server-side and always streams. */
           stream: wantsStream,
           questionPath }),
       });
@@ -340,7 +437,7 @@ export function AiAssistantDrawer() {
         if (!edits) {
           push("This page's table doesn't support adding or removing columns.", "info");
         } else {
-          const n = applyEdits(active.key, edits);
+          const n = applyEditsRouted(edits);
           /* AN EMPTY COLUMN MUST NOT READ AS SUCCESS. The model is inconsistent about
              filling `values`: the same request produced 20 values one run and NONE the
              next, which added a correctly-placed but entirely blank column. Silence
@@ -416,7 +513,7 @@ export function AiAssistantDrawer() {
         if (pinned.dropped) {
           console.warn(`[ai] dropped ${pinned.dropped} edit(s) that fell outside the focused tile "${focus?.path}"`);
         }
-        const n = applyEdits(active.key, pinned.edits);
+        const n = applyEditsRouted(pinned.edits);
         /* Say when part of it was refused rather than reporting a clean success:
            the user is focused on ONE tile and an edit aimed elsewhere is exactly the
            bug this guard exists to stop. */

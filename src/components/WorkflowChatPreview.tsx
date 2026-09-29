@@ -1,9 +1,12 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { useProfile } from "../data/ProfileContext";
 import { useAiAssistant } from "../data/AiAssistantContext";
-import { buildSmsBrain, askSmsAgent, resolveGreeting, SMS_AGENT_SCOPE_PATH } from "../data/smsBrain";
+import { buildSmsBrain, askSmsAgent, resolveGreeting, SMS_AGENT_SCOPE_PATH, SMS_WORKFLOW_SCOPE_PATH, type SmsWorkflowAgent } from "../data/smsBrain";
+import { smsWorkflowFlow } from "../data/workflowDrawers";
+import { smsConfigFor, type SmsConfig } from "../data/smsTemplate";
 import { QUESTIONS_PATH } from "../data/questionImport";
 import type { AgentConfigView } from "../data/schema";
+import { useExtraWorkflows } from "../data/quoteWorkflow";
 
 /* =============================================================================
    WorkflowChatPreview — the "Preview Workflow" chat drawer on an SMS workflow
@@ -70,14 +73,25 @@ function RefreshIcon() {
   );
 }
 
-export function WorkflowChatPreview({ workflowName, wfSlug, minimal, onClose }: {
+export function WorkflowChatPreview({ workflowName, wfSlug, wfAgent, minimal, onClose }: {
   workflowName: string;
   wfSlug?: string | null;
+  /* THE WORKFLOW PAGE'S OWN `agent` HALF, already resolved through its override.
+     ⚠️ **PASSED IN RATHER THAN LOOKED UP, because this component may not register a scope.**
+     The page has registered its diagram (with `agent` merged into the same object) and
+     `registerScope` is last-write-wins, so reading it here with `usePageData` would silently
+     repoint the page's sparkle away from the tree. Absent for the built-in SMS workflow and
+     for a created one, in which case the brain falls back to the authored data exactly as
+     before. */
+  wfAgent?: SmsWorkflowAgent;
   onClose: () => void;
   /* An empty workflow: greet, classify, hand off. Absent means the configured agent. */
   minimal?: boolean;
 }) {
   const { profile, profileId } = useProfile();
+  /* Includes any workflow created by an LSA quote request submitted during this demo,
+     newest first — one definition, so a slug that lists here also resolves elsewhere. */
+  const extraWfs = useExtraWorkflows(profile);
   const { effectiveData, registerBase, openDrawer, undo, canUndo, readOnly } = useAiAssistant();
 
   /* The SMS agent's questions live under the PREVIEW AGENT page's scope, so an
@@ -102,18 +116,37 @@ export function WorkflowChatPreview({ workflowName, wfSlug, minimal, onClose }: 
   }, [effectiveData, agentKey, profile.reports.agentConfig]);
 
   const wf = wfSlug
-    ? (profile.reports.extraWorkflows ?? []).find((w) => w.slug === wfSlug)
+    ? extraWfs.find((w) => w.slug === wfSlug)
     : undefined;
   /* ⚠️ **A MINIMAL PREVIEW MUST NOT INHERIT THE CONFIGURED AGENT.** Same reasoning as
      `useBrain`'s minimal branch on the voice side: the prospect's playbook, questions and
      offer are all correct for the configured workflow and all wrong for one with no actions.
      `voiceMinimal` picks the empty-workflow flow in `buildSystem` for either channel. */
+  /**
+   * ⚠️ THE BUILT-IN WORKFLOW'S OWN CONFIG, read from the page this drawer is opened FROM — so
+   * "Preview Workflow" obeys the diagram beside it. Same read as the Preview Agent tab does
+   * cross-page, through the one shared key, rather than a prop threaded down for one field.
+   */
+  const wfTree = !wfSlug
+    ? (effectiveData(`${profileId}::${SMS_WORKFLOW_SCOPE_PATH}`) as
+        { branches?: unknown[]; sms?: unknown } | undefined)
+    : undefined;
+  const flow = useMemo(() => {
+    if (!wfTree?.branches?.length) return null;
+    const cfg = { ...smsConfigFor(profile), ...((wfTree.sms as object) ?? {}) } as SmsConfig;
+    try { return smsWorkflowFlow(profile, wfTree as never, cfg); } catch { return null; }
+  }, [profile, wfTree]);
+
   const brain = useMemo(
     () => (minimal
-      ? { ...buildSmsBrain(profile, agentConfig, wf), voiceMinimal: true, openingMessage: undefined,
-          customSystem: undefined, playbook: undefined }
-      : buildSmsBrain(profile, agentConfig, wf)),
-    [minimal, profile, agentConfig, wf],
+      /* ⚠️ `steps` IS CLEARED HERE TOO. A minimal preview drops `customSystem` and `playbook`
+         for the reason above, and the workflow's own flow is part of that same playbook —
+         leaving it in would have an empty workflow work through a flow its diagram shows
+         nothing of, which is the exact mismatch this branch exists to prevent. */
+      ? { ...buildSmsBrain(profile, agentConfig, wf, wfAgent), voiceMinimal: true, openingMessage: undefined,
+          customSystem: undefined, playbook: undefined, steps: undefined, workflow: undefined }
+      : buildSmsBrain(profile, agentConfig, wf, wfAgent, flow)),
+    [minimal, profile, agentConfig, wf, wfAgent, flow],
   );
 
   const [messages, setMessages] = useState<Msg[]>([]);

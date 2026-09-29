@@ -123,6 +123,276 @@ Measured: 201.6s on a real run (budget 300s), 20 phases captured, 0 audit failur
 to `main` — main auto-deploys, and a 2am agent must not deploy. See
 [[invoca-demo-status-and-next-step]] in user memory for the routine id.
 
+### Error handling: one funnel, and the rate limiting that makes it readable (9/16/2026)
+Asked for directly: *"I want to get notified when anything goes wrong with the platform, the
+small things like a feature is not working to bigger things like voice agent is not working or
+the whole platform is down."* Then, on how: *"the best way to do it, not the easiest"*, with
+**Slack** as the channel.
+
+**MEASURED FIRST, and the gap was not where it looked.** The pieces were mostly here — the
+canary already models generation health correctly, `engine/mailer.ts` already sends — and what
+was missing was somewhere for a failure to GO:
+
+| | state before |
+|---|---|
+| server errors | **21 `console.error` sites, and console was the only destination.** Render keeps the logs; somebody has to go and look |
+| the browser | **completely dark**: no `window.onerror`, no `unhandledrejection`, and `DashboardBoundary` caught render errors and told NOBODY |
+| unhandled throws | no `uncaughtException`, no `unhandledRejection`, **no Express error handler at all** |
+| the canary's verdict | computed only when somebody READ `/api/canary` — if the tick died, the endpoint said so and nothing was told |
+
+⚠️⚠️ **THE ONE FACT THAT SHAPES ALL OF IT: YOU CANNOT DETECT YOUR OWN OUTAGE FROM INSIDE THE
+BOX.** The canary, `/api/status` and the mailer all run in the web process, so "the platform is
+down" needs a watcher outside Render (that half is the user's to turn on — see the end). Every
+other case can be reported from inside, and now is.
+
+#### `engine/alerts.ts` — the funnel
+⚠️⚠️ **THE RATE LIMITING IS THE FEATURE, NOT A NICETY.** An error in a hot path fires per
+request, and a channel that delivers five hundred copies of one fault is a channel you mute —
+after which the platform is *less* monitored than with nothing, because now you believe it is
+covered. Three layers: dedupe by **signature** (a stable `key`, not the message — a message
+interpolates ids); a re-send after the 30-minute cooldown carrying "fired N times since the last
+alert", so a persistent fault escalates rather than going quiet; and a **global ceiling** of 12
+an hour, past which one "being rate limited" notice is sent and the rest are counted.
+⚠️ **SLACK IS A WEBHOOK URL AND NOTHING MORE**, which is what keeps an approval off the critical
+path. `docs/INTEGRATIONS.md` records a CLOSED request for exactly this — *"Slack notification
+when my demo finishes generating"*, rejected because *"it needs a Slack app and workspace
+approval"* — but that was for `search:read`. Posting to one channel can come from an
+incoming-webhook app (small approval), Slack's own **email-to-channel address (no approval at
+all**, and it arrives through the mailer path), or a Workflow Builder webhook. The code cannot
+tell them apart. Email is the FALLBACK, not a second channel: two channels for one fault is two
+things to mute.
+⚠️ A **dead webhook falls back to email** rather than losing the alert — a revoked webhook is
+exactly the quiet breakage that would otherwise take the whole channel with it.
+⚠️ **NON-PRODUCTION LOGS INSTEAD OF SENDING** (`ALLOW_ALERTS=1` overrides), the same rule and
+the same reasoning as `sendMail`.
+
+⚠️⚠️ **THE COOLDOWN IS PERSISTED TO `DATA_DIR/alerts.json`, AND THAT IS WHAT SURVIVES A CRASH
+LOOP.** `uncaughtException` alerts and then exits; the host restarts; with in-memory state only,
+the same fault notifies on every boot — the storm the dedupe exists to prevent, arriving by a
+different door.
+
+**`engine/admins.ts` is new: the admin list was EXTRACTED from `demoApi.ts`** so the funnel can
+read it without a `demoApi -> alerts -> demoApi` cycle, since an alert has to be callable from
+anywhere a failure happens — including a failed demo write. `demoApi` re-exports `adminEmails`,
+so `feedbackApi` and `audit:app` are unchanged. Same reasoning that moved `leadSlug` and
+`isProspect`.
+
+#### The three bugs the audit found in my own funnel
+Worth recording because each was invisible to a type check and two were invisible to reading:
+1. **`repeats` was off by one, and was two different definitions.** Returning `since - 1` made a
+   first report read 0, and therefore made the *second* occurrence of a quiet fault also read 0 —
+   indistinguishable from "never happened before". It counts occurrences now and `render()`
+   decides when to print.
+2. **The title was uncapped.** The detail and context values were capped from the start; the
+   title, which is where an exception message most often lands, was not. A 5,000-character title
+   produced a 5,000-character Slack message.
+3. **Repeat counts were lost across a restart**, because the state was only persisted when a
+   notification was sent. The escalation line is most valuable for a long-lived quiet fault, and
+   that was the exact case that lost it. A throttled write (60s) keeps both: counts survive a
+   restart, and a storm costs one write a minute. **Consequence, stated:** occurrences inside one
+   throttle window can be lost to a restart. That is a count slightly low, never a missed
+   notification, because `notifiedAt` is written the moment one goes out.
+
+#### `POST /api/client-error` — a broken screen reports itself
+⚠️⚠️ **REGISTERED BEFORE `installAuth`, WHICH IS A DELIBERATE TRADE.** Behind the gate, an
+expired session turns the report into a 302 to Google and the error is lost — and a session
+expiring mid-demo is exactly when things break. So every consequence is handled instead: the body
+is capped at 8KB, every field truncated, the signature NAMESPACED `client:` so a caller cannot
+forge a server-side one, and the funnel's hourly ceiling means the worst an abuser achieves is a
+handful of messages followed by suppression. It answers 204 whatever happens — a reporter that can
+fail gives the page a second error to handle, on a path that only runs when something is already
+wrong.
+⚠️ **DEDUPED ON THE CLIENT TOO, and that is not belt-and-braces.** A React render loop fires the
+same error hundreds of times a second; the server's cooldown stops the *notifications*, and only a
+local guard stops the *traffic* — from the browser, during a demo, on the machine already
+struggling. Verified live: the second throw of the same signature produced **zero** further
+requests.
+⚠️ **BOTH GLOBAL CHANNELS ARE HOOKED.** A rejected promise never reaches `onerror`, and this app
+is almost entirely async — every `/api/*` call, the SSE stream, the LiveKit connection. Hooking
+only the synchronous one would have missed the failures most likely to happen.
+⚠️ **A BROKEN IMAGE IS NOT A PLATFORM FAILURE.** A failed asset also fires `"error"`, with no
+`error` object and the ELEMENT as the target; unfiltered, every 404 favicon would report as a
+fault. Verified live: a missing image produced zero reports.
+⚠️ **`keepalive: true`**, because a crash is often followed by a navigation and an in-flight fetch
+dies with the page.
+
+#### The boundary was swallowing errors, and it only covered half the app
+⚠️⚠️ `DashboardBoundary` caught the throw, rendered a tidy Undo button and **reported it
+nowhere** — the one place in the app that KNOWS a render failed was also the one certain not to
+say so. It has a `componentDidCatch` now, carrying the route and the prospect (which demo was
+open is the first thing anybody would ask, and what makes it reproducible).
+⚠️⚠️ **AND IT ONLY EVER WRAPPED `AppShell`'s `<Outlet/>`** — so Launch, the Preview Agent phone,
+Google Search, the four Salesforce screens and `/replica` had **no boundary at all**, and neither
+did the shell's own TopBar and Sidebar. A throw in any of those blanked the whole app. A new
+`ScreenBoundary` wraps the entire route tree; nesting is deliberate, since React uses the NEAREST
+boundary, so an in-shell screen still gets the Undo fallback and this one only handles what that
+cannot reach.
+
+#### The two automatic health signals
+- **The canary's own verdict now raises an alert**, read back out of `toPublic()` rather than
+  re-derived, so the Slack message and `/api/canary` cannot disagree about the same night.
+  ⚠️⚠️ **HALF OF THIS SILENTLY DID NOT SHIP IN THE FIRST PUSH (`c3d6749`), AND THE WAY IT WAS
+  FOUND IS THE POINT.** Splitting that commit meant replaying the alerting edits onto HEAD one
+  at a time, and one was missed: `setInterval(alertOnCanary, TICK_MS)`, the PERIODIC evaluation.
+  So the post-run call shipped and the arming did not — meaning a canary that **stopped running
+  altogether** (the *missing* / *stale* case, which is the whole "silence is not success" point)
+  would have reported nothing, while every other part of the feature looked present. Caught by
+  diffing every alerting marker between `HEAD:server.ts` and the working tree before the next
+  push, rather than by trusting the split. **Do that comparison after any hunk-level split of a
+  feature**: a dropped hunk is invisible in a passing build and a passing audit. It
+  covers *missing* and *stale* too, which is the "silence is not success" case that previously
+  required a human to load the endpoint. **At most once per ET day** — the funnel's 30-minute
+  cooldown would otherwise allow ~48 notifications for a signal that changes once a night, and a
+  daily signal that pages twice an hour is a daily signal you mute. `etParts` was hoisted out of
+  `scheduleCanary` so both use one answer to "what ET day is it".
+- **Voice: the watchdog reports when no agent ever joins.** ⚠️⚠️ **AND IT IS DELIBERATELY NOT A
+  WORKER-REGISTRY CHECK.** `/api/status`'s `livekitConfigured` only proves three keys exist; it
+  says nothing about a worker being registered under this environment's `voiceAgentName()`, and
+  the worker ships by `lk agent deploy` rather than `git push`, so a stale one is invisible. But
+  `livekit-server-sdk` exposes no worker registry to ask, and inventing one would be a check that
+  cannot be verified — the trap this file records repeatedly. What IS ground truth is the moment
+  30 seconds elapse with nothing in the room: every documented cold start is over by then, so it
+  is a dead worker or a wake-up far outside LiveKit's stated window, and both are worth knowing.
+  It reports through the same client reporter, so it needed no new endpoint.
+
+#### `/api/status` carries the counts
+⚠️ **COUNTS AND SIGNATURES ONLY, NEVER THE DETAIL** — that route is PUBLIC, and the standing rule
+is counts and booleans. `"chat-500"` is safe; the message that produced it is not, because a
+message can quote a prospect or a URL. `alertSummary()` is built for this endpoint and
+`audit:alerts` asserts the redaction by alerting with a prospect name in the detail and checking
+it cannot be found in the summary. Passed IN by both twins like every other field, per the note at
+the top of `status.ts`.
+
+#### ✅ FIXED (9/16/2026): `server.ts` IS TYPE-CHECKED NOW
+The finding below stood for about an hour and cost a real bug in the meantime, so it earned
+its own fix. `tsconfig.node.json` now includes **`server.ts` and `googleAuth.ts`**, and
+`tsc -b --force` is clean with them in.
+
+⚠️⚠️ **THE BLOCKER WAS ONE IMPORT, AND THE FIX FOLLOWS A PATTERN THIS FILE ALREADY HAS.**
+43 of the 44 errors came from `server.ts:591`'s dynamic `import("./src/data/replicaPages.ts")`
+— a module full of `HTMLInputElement`, `Document` and `HTMLIFrameElement`, in a project that
+compiles with `lib: ["ES2023"]` and no DOM. `src/data/leadFields.ts` was extracted for exactly
+this reason once already (its own header says so, and `audit:replicas` records that importing
+`replicaPages.ts` from `engine/` "breaks `npm run typecheck` — sixteen errors"). So:
+**`src/data/replicaRegistry.ts`** now holds the static registry and its lookups
+(`ReplicaPage`, `REPLICAS`, `replicaFor`, `replicaExpired`, `replicaBySlug`, `replicaSlugs`),
+`replicaPages.ts` **re-exports** them so no existing importer changed, and both server twins
+import the registry. The field-map DERIVATION, which reads a live document, stays behind.
+⚠️ The other error was an unused `req` on `/auth/logout` (`noUnusedParameters`), renamed `_req`.
+
+⚠️⚠️ **WHAT THE GAP ACTUALLY COST, both in this repo's own history rather than in theory:**
+1. a required field added to `StatusInput` went unnoticed at the `deployStatus({...})` call
+   site in `server.ts`;
+2. while splitting the alerting commit, a **duplicated brace** in `server.ts` passed
+   `tsc -b` and surfaced only when the server was booted (`Expected "finally" but found
+   "}"`). A commit was minutes from shipping a file that cannot parse.
+**Both were reintroduced deliberately and are now caught** — `TS2345` for the missing field,
+`TS1472` for the brace.
+
+⚠️ **`audit:replicas` PINS BOTH HALVES, because either alone is worthless**: the include, and
+the server not importing a browser-only module. Five checks — server.ts and googleAuth.ts in
+the include, server.ts not importing `replicaPages.ts`, the registry staying DOM-free, and
+`replicaPages.ts` still re-exporting. Verified to fire: narrowing the include reddens 2,
+re-pointing the import reddens 1.
+⚠️⚠️ **AND THE FIRST VERSION OF THOSE CHECKS COULD NOT FAIL — the exact mistake this file
+already warns about, made again.** `audit-replicas.ts` counts with `let bad = 0` and reports
+through `no()`; the new block called `bad(...)`, so a failing check would have called a NUMBER
+and crashed the script instead of printing FAIL. Both sabotages "passed". That warning is
+already written down two sections above this one; read it before adding a check to that file.
+
+#### ⚠️⚠️ THE ORIGINAL FINDING, kept for the measurement: `server.ts` WAS NOT TYPECHECKED
+`tsconfig.node.json` includes only `["vite.config.ts", "engine"]`, so **the production entry point
+has never been type-checked** — `npm run build` runs `tsc -b` plus a client-only vite build, and
+neither reads it. Demonstrated rather than argued: adding a required field to `StatusInput`
+compiled clean, and `server.ts` was calling `deployStatus({...})` without it. Measured with it
+temporarily included: **45 errors — 1 real (that missing field, now fixed), 1 trivial (an unused
+param in `googleAuth.ts`), and ~43 DOM-type errors from ONE import**, `server.ts:491`'s dynamic
+`import("./src/data/replicaPages.ts")` — a module `engine/replicaCapture.ts` already warns about
+by name ("that module is full of `HTMLInputElement`"). So the fix is not a two-line include: it
+needs that lookup moved out of a browser-side module, or a third tsconfig with the DOM lib.
+**Left as a flagged finding rather than restructured mid-build**, and it belongs high on the
+error-handling list, because an untypechecked production entry is a source of exactly the runtime
+errors this work exists to catch.
+
+#### Then: every failure path wired, through ONE helper (9/16/2026)
+The gap left by the first pass, and it was the important one. **18 `console.error` sites in
+`server.ts`, 5 alerts** — and the 13 that mattered all CATCH and respond, so they never reach
+the Express error handler either. Generation, chat, analyze, the demo library, the feedback
+board, Gong, Drive, the ZIP lookup, the voice preview, the LiveKit token mint. Two replicate
+paths logged **nothing at all**, which is worse than a bare log: not even a line to find later.
+
+⚠️⚠️ **A HELPER (`routeFailed`) RATHER THAN 13 PAIRED CALLS, AND THAT IS THE WHOLE POINT.** Two
+statements that must always appear together will eventually appear apart, and the failure is
+invisible: the endpoint still answers, the log still has its line, and nobody is told — which is
+precisely the state this work started from. One function cannot log without alerting.
+
+⚠️⚠️ **THE LEVELS ARE THE DIFFERENCE BETWEEN A CHANNEL YOU READ AND ONE YOU MUTE.** Not
+everything pages:
+| path | level | why |
+|---|---|---|
+| generation, chat, analyze, demos, feedback, LiveKit token | **page** | ours, and broken means a feature is down |
+| **generate-persist** | **page** | the prospect was DELIVERED and then lost — silent data loss |
+| chat / ai-assistant when `isOverloaded(e)` | **record** | a 529 is expected, self-correcting, and already surfaced as "briefly overloaded, please resend" |
+| replicate (both paths) | **record** | usually the TARGET site blocking a datacenter IP (AutoNation and Orlando Health both do) — not ours, not actionable at 2am |
+| Gong, ZIP, voice preview | **record** | one integration or one control degrades |
+
+⚠️ **THE CANARY TICK NOW REPORTS ITS OWN THROW.** It was covered only indirectly: no run
+recorded means `toPublic()` reports *stale* the next day. True, but a day late.
+
+⚠️ **THE DEV TWIN IS DELIBERATELY NOT WIRED.** Alerting is a production concern and local logs
+rather than sends, so 13 more `alert()` calls in `vite.config.ts` would be churn for no signal.
+That asymmetry is principled rather than an oversight — unlike `/api/client-error`, which IS in
+both twins, because the client posts unconditionally and a missing route would answer with
+`index.html` and read as success.
+
+**`npm run audit:alerts` is 47 checks**, and it is the reason to trust any of the above.
+⚠️⚠️ **IT DELIVERS TO A LOCAL HTTP SERVER IT STANDS UP ITSELF.** The dedupe, the cooldown and the
+ceiling are only observable once a send SUCCEEDS — with no channel configured every call returns
+`sent: false` and every check would pass against a funnel that dedupes nothing. That is the
+tautological-check trap this file records three times over, so the fake webhook is not
+convenience, it is the only way the assertions mean anything.
+⚠️ It also checks the **wiring**, because a perfect funnel nobody calls is the silent no-op this
+file records six times: both process handlers, the crash alert being AWAITED (a floating promise
+dies with the process, so the most important notification is the one that would never leave), the
+Express handler's **four-argument arity** (Express decides by arity — a three-argument one is
+ordinary middleware and silently never runs) and its registration AFTER the catch-all, both twins
+serving the endpoint, the boundary reporting, and the route tree actually being wrapped.
+⚠️ Five sabotages were each verified to fire: removing the dedupe (7 red), disabling persistence
+(1), removing the ceiling (4), leaking the detail into the summary (1), and removing the
+non-production gate (1).
+⚠️⚠️ **AND IT CHECKS THE REMAINDER, NOT A CALL COUNT.** Counting `routeFailed` sites would pass
+the day somebody adds a 16th handler that quietly goes back to a bare `console.error`. Instead
+every surviving `console.error` in `server.ts` must match a short allow-list of things that
+legitimately are not routes (the helper itself, the two crash handlers, canary scaffolding, the
+boot seeder). Verified by putting one route back to a bare log: it reddens and **names the file
+and line**.
+
+**Verified live in the browser**, not by construction: a thrown `TypeError` and a rejected
+`RangeError` both reached the funnel and appear on `/api/status` as `client:/:TypeError` and
+`client:/:RangeError`, with the dev-server log showing the signature, title and detail and
+correctly declining to send because this is local.
+
+**And verified end to end against the PRODUCTION entry point** (`npm start` with a stand-in
+webhook on localhost, so no real credential was involved), both levels through real endpoints:
+- `/api/replicate/probe` with an unreachable URL — the route genuinely threw, `routeFailed`
+  logged `api:replicate`, it was counted on `/api/status`, and **nothing was posted**, which is
+  what `record` means;
+- `/api/client-error` — posted, carrying route, `caught: boundary`, the prospect, the user agent
+  and the environment tag.
+`/api/status` then read `channel: "slack"` with both signatures and their counts and **no detail**.
+⚠️ `/api/analyze` with no API key was tried first and correctly alerted NOTHING — it guards on
+the missing key and returns early rather than throwing. A guard is not a failure.
+⚠️ **NOT verified by a forced render crash**: the boundary's report path is checked by the audit
+and shares the reporter proved above, but no screen was made to throw for real. Say so rather than
+implying otherwise.
+
+**Still needs credentials the assistant cannot create** — and until then the funnel degrades
+honestly (`channel: "none"` on `/api/status`, everything logged): a `SLACK_WEBHOOK_URL` or a
+channel email address, Render's own deploy/service-failure notifications turned on, and an
+external HTTP monitor on `/healthz` with a **2-failure threshold** (the drain returns 503 for ~40s
+on every deploy, so a 1-strike monitor pages on every push). Sentry, for grouped stack traces with
+source maps, is the other half of "best" and is not built.
+
 ### "Lead Form Performance Summary" — Marketing Performance dashboard
 A KPI card directly UNDER "Call Performance Summary", same 4-tile shape so the two
 read as a channel pair: Lead Form Count · the prospect's engagement-rate tile · the
@@ -940,11 +1210,783 @@ gets an editable diagram. `SHAPE` holds per-prospect shape defaults (National Va
 Lines' two-team split, previously a 100-line component, is now a branch with two
 leaves). `extraTree` maps an extra workflow's flatter branches onto the same model.
 
+### The built-in SMS workflow is the measured six-row template, for every prospect (9/17/2026)
+Asked for directly, with **thirteen SingleFile captures of a real Greenix SMS workflow attached**:
+*"this is the workflow i want to replicate for all prospects"*, plus *"the fields in the drawers
+are greyed out but i want you to make them white"* and *"add the 'add' functionality"*. Answers to
+the three questions asked before building: **Apply really saves**, **the built-in workflow only**
+(authored extras keep their own shapes), and **drop the MCP references**.
+
+Every capture is in `reference/agent-workflow/sms-*.html` — the tree plus one per drawer, and the
+EMPTY Qualify template that shows the editable state. `src/data/smsTemplate.ts` is the spine.
+
+⚠️⚠️ **THE PRODUCT'S OWN MODEL IS RECURSIVE, AND THE CAPTURE SAYS SO OUTRIGHT.** Every node below
+an intent is the same react-flow type — `react-flow__node-segment` — whether it is "All Sales
+Inquiry Users", "New Customer, No" or "Serviceable=true". So there is no leaf-versus-path
+distinction in the product; there is one kind of node that nests. Ours stopped at two levels
+(`leaves` -> `paths`), so this needed exactly **one** more (`TreePath.paths`), not a rewrite:
+
+```
+Triggered by            y=0     "0 Campaigns, 2 Forms, and 1 Inbound SMS"
+Conversation Start      y=168   "SMS · classify intent"
+Sales Inquiry           y=336   Need Support
+All Sales Inquiry Users y=504   All Support Users      Qualify / Support & Escalate
+New <Noun>, No          y=672   Existing <Noun>, Yes   both Qualify
+Serviceable=true/false  y=840   found= true / false    all four Inform
+```
+
+⚠️⚠️ **THE GEOMETRY IS `smsV2`, A THIRD GEO ENTRY — NOT A CORRECTION TO `sms`.** Read off the
+react-flow transforms: **248px nodes on a 296 pitch** (248 + 48) and a **uniform 168 row pitch**,
+corroborated by the edge paths, which run between node CENTRES at `left + 124` and also give the
+node heights (trigger 93, start 69, intent 93, segment 81). So the real SMS page is far closer to
+our `voice` geometry than to `sms`. `sms` is left alone because **seven signed-off extra workflows
+draw it** (Orlando Health's five ER trees, Avi & Co - New, the generated quote-request ones), and
+editing it would restyle all of them for a change asked about the built-in workflow.
+
+⚠️⚠️ **A LATENT BUG THE DEEPER TREE EXPOSED: THE TOP OF THE TREE WAS CENTRED ON THE CANVAS, NOT ON
+ITS OWN BUS.** The branch bus has always spanned `firstCx`..`lastCx` (the two intent centres) while
+the stem feeding it dropped at `W / 2`. Those coincide only on a tree whose branches carry the same
+number of terminals — which every SMS tree did, one per branch. With four terminals under Sales and
+one under Support the trigger sat **222px left of the bus it connects to**. The capture settles the
+rule: its Triggered by is at x=938, exactly the midpoint of its two intent centres (568 and 1308)
+and NOT of its columns (716). `topCx` fixes it, and it is a **no-op on a symmetric tree** —
+verified on the voice tree BEFORE changing it (trigger, bus centre and stem all read 840 already),
+which is what keeps the signed-off diagrams still.
+
+⚠️ **THE PATH ROW IS DEDUPED AND CENTRED NOW TOO.** It rendered one node per COLUMN keyed on the
+flat slot index, correct only while a path IS a terminal; once a path has children it spans several
+columns and the node drew once per child. Same `new Map` dedupe and `*Cx` midpoint the leaf row
+already used. The leaf->path bus likewise spans **path centres** rather than the outermost terminal
+columns — the capture's own edges run leaf centre -> path centre (x=568 to x=272).
+
+⚠️ **CHIPS CAP AT FOUR, THEN `...`** — measured, and all five chips on a capped node carry
+byte-identical classes, so the ellipsis is an ordinary chip rather than a muted variant. Rendering
+all ten made a node three times its height and dragged its whole levelled row with it.
+
+⚠️ **THREE ICONS EXTRACTED VERBATIM**, per the standing use-the-real-icons rule: `callSplit`
+(Qualify) and `info` (Inform) did not exist here at all, and the support glyph is **`headsetMic`,
+not the `headset` we already ship** — that one has no mic boom. `headset` is untouched because the
+voice tree draws it.
+
+#### The drawers: measured copy, and an Apply that really saves
+⚠️⚠️ **THE SMS COPY IS NOT THE VOICE COPY, WHICH IS WHY THESE TABLES ARE SEPARATE.** Four strings
+differ, and the structure differs too:
+| | voice (8/26) | SMS (9/17) |
+|---|---|---|
+| inform label | "Inform & Route" | **"Inform"** |
+| inform description | "The agent will answer the caller's question and transfer them…" | **"Provide information to the caller."** |
+| inform prompt | "How should the agent inform and route callers?" | **"How should the agent inform users?"** |
+| escalate description | "…escalate by transferring to the queue configured below." | **"…escalate based on the rules and destination configured below."** |
+| inform fields | a phone number | **no phone row at all** — straight to Signal + What To Collect |
+| escalate destination | a phone number | **a text input**, "Where should the agent escalate unresolved users?" (❌ this row read "an empty combobox" until 9/17/2026 — corrected below) |
+| trigger drawer | count + 2 links | count + **the forms and inbound number listed** + 3 links |
+
+⚠️ **THE `Inform` LABEL WAS NEARLY MISSED BECAUSE SingleFile WRITES UNQUOTED ATTRIBUTES.** The
+combobox carries `value=Inform`, which a `value="..."` search does not match, so the field read as
+empty and the drawer kept the voice label. Same trap this file already records for the Aptive form
+capture and the insights SVG.
+
+⚠️⚠️ **EDITABLE ONLY WHERE IT IS TOLD WHERE TO WRITE.** The grey the user described is the REAL
+product's read-only state (measured: every field in the twelve configured captures carries
+`disabled`, 12 `Mui-disabled` classes, and **no footer at all**); the empty template is the white
+one, with an Add button and Cancel / Apply. Ours were already `background: #fff` — what was missing
+was that every control was `readOnly` and `Add` was an `e.preventDefault()` stub. Editing is now
+gated on `onApply` **plus** the drawer carrying `edits` write-paths, so a field with no home cannot
+accept a keystroke that goes nowhere — the silent no-op recorded six times in this file. That gate
+is also what keeps the **voice drawers byte-identical**: they were signed off read-only and nobody
+asked to change them (asserted).
+
+⚠️⚠️ **THE SEGMENTS ARE THE CHILD NODES, SO `Add` WRITES THE TREE.** A Qualify node's
+Answers/Segments ARE the boxes on the row below — `workflowDrawers` has read them from the tree
+since 8/27 with the note that says why. So `SmsConfig` deliberately holds **no** `segments`: the
+only things registered are the fields the diagram cannot draw (questions, fallbacks, the four
+instruction blocks, the escalation text, the intent descriptions and rules). Apply writes segment
+changes to `branches.…paths` as whole NODES, carrying `segmentNodes` along so renaming one answer
+cannot flatten the branch underneath it — verified: after adding a third answer, `paths.0.paths`
+still held `Serviceable=true` / `Serviceable=false`.
+
+⚠️ **APPLY RIDES `applyEdits` INTO THE PAGE'S OWN SCOPE**, which is what hands these edits
+persistence per demo, an undo step on the page's stack and the `readOnly` refusal on somebody
+else's demo, none of which a bespoke writer would get. `sms.intents.*.rules` joined
+`LENGTH_IS_CONTENT`, **scoped to `sms.`** for the same reason `agent.` is: a bare `/rules$/` would
+widen rule 2 across every screen carrying a `rules` array.
+⚠️ **THE DRAWER READS THE EFFECTIVE CONFIG, NOT THE BASE.** Handing it `smsBase` would open it on
+the template's defaults, and Apply would then write that stale copy back over an edit made a minute
+earlier. Same trap `drawerFor` records for the voice spec.
+⚠️ **CANCEL REALLY DISCARDS** — every edit lands in a local draft keyed on the drawer's identity,
+so a mid-demo keystroke costs nothing and reopening a node never shows the last one's half-typed
+text.
+
+#### What was re-skinned, and what was refused
+⚠️ **GREENIX'S TWO REAL SUPPORT NUMBERS ARE GONE** (844-233-7378, 833-729-4353), rebuilt on the
+prospect's own area code with the reserved 555 exchange — the same rule the Google Search ad's call
+extension follows. So is its inbound number.
+⚠️ **THE MCP TOOL NAMES ARE GONE, on the user's own call when asked.** The capture instructs the
+agent to call `greenix_check_zip_serviceable_greenhl` and `greenix_search_customer_greenhl`; a
+`<slug>_check_zip_serviceable` on 145 prospects would be inventing an integration none of them has.
+The instruction survives in plain English, which is what the field is for.
+⚠️ **THREE COLLECT FIELDS WERE DROPPED RATHER THAN TRANSLATED.** "Pest Types" carries a
+pest-control meaning no other vertical has, and "Property Type"/"Business Type" are a
+residential-versus-commercial split that reads wrong for a hospital or a hotel. What survives is
+either platform chrome or genuinely derived from the prospect, so every entry reads correctly on all
+145 profiles. Same refusal as the ZIP3 guess and the fabricated accreditations.
+⚠️ **THE CONDITION LABELS ARE VERBATIM, UNEVEN SPACING INCLUDED** — `found= true` and
+`found = false`, one space before the equals on one and after it on the other. That is what the SE
+typed and what the product draws; tidying it is the replica drifting from the thing it replicates.
+Asserted, and the check fires.
+
+**`npm run audit:ai` gained 24 checks** covering the shape against the capture, the re-skin (no
+Greenix name, no real numbers, no MCP tool names, the 555 exchange, the prospect's own noun), each
+drawer's structure, the editable gate in both directions, and a **135-combination sweep of the
+six-row layout** asserting no connector inverts and that a tree WITHOUT a sub-row gets no
+sixth-row geometry at all (`rowAt` mutates the shared shift — the trap already recorded for the
+sub-bus). Five sabotages were verified to fire: tidying a condition label, restoring the voice copy,
+putting the phone row back, reintroducing an MCP name, and flattening the recursion.
+⚠️ **TWO OF THE NEW CHECKS FAILED ON CORRECT CODE FIRST — the fourteenth and fifteenth probe faults
+in this file.** Both asked `"edits" in x`, which is FALSE when the builder simply omits the key,
+i.e. exactly the read-only state they were written to confirm.
+⚠️ **AND THREE CHECKS HAD TO BE RE-AIMED, NOT LOOSENED.** Three existing ones pinned the SMS intent
+titles by grepping `AgentWorkflow.tsx`; the template moved to its own module, so they now BUILD the
+tree and read it, which is strictly stronger (a grep passes against `if (false && ...)`). The
+intent-count check went 8 -> 6 for the same reason. `audit:ai` also caught the template declaring
+its own copies of the four chrome names instead of importing them from `workflowChrome.ts`.
+
+**Verified in the browser**, at 1600px: 12 nodes on 6 rows at a uniform 168 pitch, 248px wide, a
+296 column pitch, every parent centred over its own children, trigger/stem/bus-centre all 962,
+whole tree fitting with no scroll. The Qualify drawer opens re-skinned ("Are you a new or existing
+Aptive homeowner?"), all fields editable; **Add appended an answer, Apply created a real node
+(12 -> 13) that survived a reload**, and the page's undo took it back to 12 and cleared the
+override. Cancel discarded a pending Add. The four other drawer kinds each match their capture.
+**Untouched and checked: the voice tree (12 nodes) and all three of its drawers, still entirely
+read-only, two trigger links, no rows.**
+
+#### Then: the measured palette, the dots, and the missing intent descriptions (9/17/2026)
+Three things reported against the first build, with a fresh capture attached
+(`reference/agent-workflow/sms-tree-v2.html`, which serialises its emotion CSS — so everything
+below is a real computed style rather than a screenshot reading):
+*"1. the boxes and pills are not the right color. 2. the background dots are too far apart and
+also make them lighter. 3. The Sales Inquiry and Need Support are missing their description,
+which should match what's in the box when clicked."*
+
+⚠️⚠️ **A NODE IS TINTED BY ITS ACTION, AND `tone` COULD NOT EXPRESS THAT.** The product's whole
+system is one hue per action: the card is that hue at **8%** with a **5px solid LEFT edge** at
+full strength and **no other border**, the glyph sits in a **26px box of the same hue at 12%**,
+and the action text and glyph take a **dark ink** of it. `tone` is one word for a whole card and
+carries no ink, so `TreePath.actionKind` / `TreeLeaf.actionKind` were added (opt-in) and the
+three `.wf-act-*` rules read them:
+| action | hue (8% fill + 5px edge) | icon box (12%) | text + glyph ink |
+|---|---|---|---|
+| Qualify | `#D0C1F2` | `rgba(208,193,242,.12)` | `#440066` |
+| Inform | `#2666F9` | `rgba(38,102,249,.12)` | `#11228C` |
+| Support & Escalate | `#FF7045` | `rgba(255,112,69,.12)` | `#B33B00` |
+
+Those inks are the platform's own — `#440066` and `#B33B00` already appear on the Integrations
+badges and `.wf-leaf-orange`. ⚠️ **AND `Inform` IS BLUE HERE, NOT THE TEAL** the Create Workflow
+note recorded for "Inform & Route" on the voice page; a different action with a different colour,
+so both notes stand.
+
+Other measured corrections to the card: radius **6** not 8, border **`#E7E9EB`** not `#d9dee4`,
+padding **12** not `10px 14px`, and **no shadow at all** — the real cards are flat and separated
+by their border alone. Conversation Start is **`#D4E0FE`**, the platform's titan blue-10. The chip
+is **12px on `#E7E9EB` at radius 100px with no border**, where ours was 11px white-on-green — so
+every pill had been tinted to the old green leaf. Connectors are **1px**, take **the colour of
+the node they point at** (neutral `#D0D3D8` into the two intents, the action hue below that), and
+each ends in a closed **arrowhead**.
+
+⚠️⚠️ **ALL OF IT IS SCOPED TO `.wf-v2`, BECAUSE `.wf-node`, `.wf-chip` AND `.wf-leaf-*` ARE
+SHARED.** The voice tree and seven authored extra workflows draw those same classes; restyling
+them for a change asked about the built-in SMS diagram is what cost this repo 79 `.cd-*` rules
+once already. `audit:ai` pins the shared rules as unchanged, and that check fires.
+⚠️ **ARROWHEADS HAD TO BE OPT-IN IN THE COMPONENT, NOT JUST IN CSS.** `marker-end` is an
+ATTRIBUTE, so no stylesheet scope can keep it off another diagram — `lineFor(kind, arrows)` gates
+it, and without that the voice tree and all seven extras grew arrowheads. Caught by measuring the
+voice tree after the change, not by reading the diff.
+
+⚠️ **THE DOTS WERE BOTH TOO COARSE AND TOO HEAVY, AND THE FIX IS ONE MEASUREMENT.** react-flow
+draws its grid as `<pattern width={gap*zoom}><circle r={size*zoom/2}>`; the capture is at zoom
+0.5 with `width=8` and `r=0.25`, so the authored values are a **16px gap** and a **1px dot** in
+**`#91919A`**. Ours was a 20px gap with a **1.1px RADIUS** — a 2.2px dot, nearly three times the
+area — which is what read as coarse and heavy even in a paler grey. The finer, tighter grid is
+simultaneously closer together and visually lighter, which is the whole of the report.
+⚠️ **NOT SCOPED:** the canvas is shared chrome and was wrong on every workflow page, so this
+fixes the voice diagram and the extra workflows too.
+
+⚠️ **THE INTENT DESCRIPTION IS THE DRAWER'S OWN STRING, CLAMPED IN CSS.** 16px/400 at the title's
+ink (not a muted grey), **flush left** — measured: the description's left edge and the title
+icon's are both the card's own 12px padding, where ours indented 24px to clear the icon — and
+`-webkit-line-clamp: 2`, which is where the "..." comes from. Clamped rather than cut in the data
+because the FULL text is what the Intent Details drawer renders and what the agent's prompt is
+built from; truncating the string would have shortened all three at once. `audit:ai` asserts the
+node's subtitle IS the drawer's `looksLike`, so the two cannot drift.
+
+**`audit:ai` gained 14 more checks** for the palette, the dots, the description and the
+shared-class non-regression. Three sabotages were verified to fire: restyling the shared
+`.wf-node`, coarsening the dots, and dropping the intent subtitle.
+**Verified in the browser** on Aptive and Orlando Health: every measured value matches
+(8%/12%/edge/ink per action, chip, card, start, 1px target-coloured connectors with arrowheads on
+exactly the 11 drops the capture has, 16px/1px/#91919A dots), and the intents carry their
+re-skinned description. **Untouched and checked: the voice tree** (8px radius, its own shadow,
+14px titles, 11px chips, 2px grey lines, **zero** arrowheads, no `.wf-v2`) **and Orlando Health's
+authored ER workflow** (10 nodes, 0 action tints, 0 markers).
+
+⚠️ **A PRE-EXISTING FAIL-OPEN NOTICED WHILE TESTING, NOT FIXED AND NOT MINE:** opening an extra
+workflow's URL whose slug no longer resolves — a generated quote-request workflow whose 7-day
+capture has expired, say — falls through to the BUILT-IN SMS workflow rather than the
+"Workflow not found" state a created workflow's unknown id gets. The heading does say
+"<Prospect> - SMS", so it is not claiming to be the missing workflow, but the route is
+fail-open where the created-workflow route is fail-closed.
+
+##### And two bugs the palette pass left behind (9/17/2026)
+⚠️⚠️ **THE LAST ROW MUST NOT BE LEVELLED, AND THE CAPTURE OVERRULES THE 9/8 SYMMETRY FIX FOR IT.**
+Reported: *"the boxes should not be all sizes, they change based on the number of pills row. so in
+this example there isnt any pills so it should be shorter."* Measured on the real bottom row:
+**152 / 152 / 176 / 78** — every node sizes to its own content, `found = false` has no pills and
+is less than half its neighbours, and even the three five-chip nodes differ because their chips
+wrap to different numbers of rows. Ours levelled the row to its tallest and gave that node
+**206px of mostly empty card**.
+
+The 9/8 rule still stands for every row ABOVE: a row's bottom is where the next row's stems start,
+so siblings hanging off one bus must share a baseline or their connectors cannot be equal.
+**Nothing hangs below the last row**, so levelling it buys nothing and costs the shape — and the
+capture agrees twice over, because its upper rows are equal-height anyway (their content is
+equal). `levelRow` takes a `level` flag, `lastRow` is computed from the tree's own depth rather
+than named, and the skip is **scoped to `v2`** so the voice tree's six use cases still sit at one
+height (verified: all six still 162 with `min-height` applied).
+
+⚠️⚠️ **A NEW ANSWER INHERITS ITS SIBLINGS' ACTION.** Reported: an answer added in the "All Sales
+Inquiry Users" **Qualify** drawer came out reading **Inform**, white and untinted. Both halves had
+one cause — Apply's default for a brand-new node was a hardcoded `{ action: "Inform" }` with **no
+`actionKind`**, and the tint is keyed on the kind, so the card lost its colour as well as its
+label. Siblings are the right source because they are peers under one question: the answers of a
+Qualify are Qualifies and the answers of one of THOSE are Informs, which is exactly the shape the
+capture draws. Falls back to Inform only when there is no sibling to copy.
+
+⚠️ **AND `repairSmsSegments` FIXES THE ONES ALREADY STORED, AT READ TIME.** The override store is
+per demo and syncs to the shared record, so a node written by the old code can reach a colleague's
+browser where no migration ever ran — the same argument `toSteps` and the marketing-source rename
+already make. A stale node is identified by the **absence of `actionKind`**, which is reliable
+because the template has always set it, so the only way one reaches the store without it is the
+old Apply path. It copies the first configured sibling, falls back to the action's own wording when
+there is none, and **returns the same object when nothing needs repairing** so it never costs a
+re-render. It also self-heals: the drawer reads the effective tree, so the next Apply writes the
+corrected action back. Verified on the reported nodes — two `Test` answers stored as `Inform` with
+no kind now render **Qualify** in lilac with the 5px `#D0C1F2` edge.
+
+**`audit:ai` gained 7 checks** here (45 for this feature): the level flag and its v2 scope, the
+computed `lastRow`, Apply's sibling inheritance, and `repairSmsSegments` against a real stale
+shape, a lone stale node, and a clean tree (identity). Three sabotages verified to fire: levelling
+the last row again, hardcoding a new answer's action, and making the repair copy a clean tree.
+**Verified in the browser:** the bottom row measures 206 / 206 / 206 / **76**, a new answer added
+under "New Homeowner, No" comes out **Inform** and 76px rather than levelled to its neighbours'
+206, and the voice tree's last row is still levelled.
+
+##### Drag the whitespace to move the diagram (9/17/2026)
+Asked for directly: *"give the user the ability to click on any white space in the workflow box
+and move the diagram around."* The real page does this and says so — measured in
+`sms-tree-v2.html`, its pane carries `cursor: grab` (`.react-flow__pane.draggable`).
+
+⚠️⚠️ **IT IS A FREE PAN ON ITS OWN TRANSFORM — AND THE FIRST VERSION, WHICH MOVED THE SCROLL
+OFFSET, WAS WRONG IN A WAY ONLY A SCREEN RECORDING SHOWED.** Scrolling works and clamps for free,
+but it can only ever travel INSIDE the content: you can never leave empty canvas on one side while
+the diagram runs off the other. The user's video does exactly that — the tree dragged right until
+its left half is bare canvas and Need Support is clipped off the right edge — so the real thing is
+unbounded, and "it clamps for free" was a feature of the wrong mechanism rather than a property of
+the real page.
+
+The pan is now `translate(var(--wf-px), var(--wf-py))` on **`.wf-fit`**, composed with — not
+replacing — the fit SCALE on `.wf-tree` inside it. Two elements, two transforms, so the drag has no
+limits and the scale the zoom buttons own is untouched. ⚠️ **AND THE ZOOM ANCHOR HAD TO LEARN ABOUT
+IT:** `zoomTo` works out the focal content point from the scroll offset, so without subtracting the
+pan, zooming after a drag snapped the diagram back by the pan distance and the node under the
+cursor slid away — the exact thing that anchor exists to prevent. Measured after the fix: 3px of
+drift across a zoom step, which is rounding.
+⚠️ **A CLAIM IN THE FIRST VERSION OF THIS NOTE WAS SIMPLY FALSE:** it said the wheel already
+scrolled this box, so a drag and a two-finger scroll would agree. The wheel is intercepted by
+`useFitScale` with a non-passive listener and `preventDefault` to ZOOM; it has never scrolled.
+
+⚠️⚠️ **WHITESPACE ONLY, WHICH IS WHAT KEEPS THE NODES CLICKABLE.** A pointerdown on a node, the
+zoom cluster or the minimap returns immediately, so opening a drawer is still one click and a drag
+can never swallow it. And because the pointer is CAPTURED from the start, a drag that begins on
+whitespace and ends over a node fires no click on that node either. Verified both ways: dragging
+from a node leaves the scroll offset untouched, and clicking one still opens its drawer.
+
+⚠️ **TOUCH IS LEFT TO THE BROWSER.** Handling it here as well as natively would move the diagram
+twice per gesture, so `pointerType === "touch"` bails and `touch-action` is deliberately not set.
+⚠️ **THE CLASS IS TOGGLED IMPERATIVELY**, not held in state: a `setState` per drag start would
+re-render the whole tree mid-gesture for the sake of one cursor.
+⚠️ **`setPointerCapture` IS IN A `try`.** It throws if the pointer is no longer active by the time
+the handler runs, and a pan that can throw would take the diagram down with it; without the
+capture the drag still works while the cursor stays inside the box, so failing there degrades
+rather than breaks.
+
+⚠️ **NOT SCOPED TO ONE TREE, and that is deliberate.** The canvas is shared chrome and the real
+product pans on every workflow page, so the voice diagram and the seven authored extra workflows
+get it too. It changes no layout and no colour — only the cursor — so it is additive rather than a
+restyle. Verified panning on both the SMS and the voice canvas.
+⚠️⚠️ **NO SCROLLBARS — asked for explicitly, and nothing was lost by hiding them.** `.wf-scroll`
+is `overflow: hidden` now. The bars had looked like the only thing advertising that the diagram
+runs past its frame, which is why the first version kept them; the drag replaces that, and the
+wheel was never scrolling in the first place (see above), so they were serving nothing but their
+own affordance. ⚠️ **AN `overflow: hidden` BOX IS STILL SCROLLABLE FROM SCRIPT**, which is what
+keeps the zoom anchor and Fit to view working unchanged — verified: setting `scrollLeft` reads
+back, and a fit still centres to the computed midpoint (158 of 158 on a 720px frame).
+⚠️ **THE DOTS TRAVEL WITH THE DIAGRAM.** They moved from `.wf-canvas` to `.wf-scroll`, where the
+pan variables live, and its `background-position` reads them — which is what react-flow does with
+its own pattern (`patternTransform=translate(-5,-5)` in the capture, the pan modulo the 8px gap).
+⚠️ **"Fit to view" CLEARS THE PAN**, and it is the only way back once the diagram has been pushed
+clean off the edge — which a free pan deliberately allows.
+⚠️ A node dragged under the zoom cluster is occluded by it, as on the real page, which lets those
+controls overlay the canvas corner. That is not a hit-testing failure; it cost one wrong diagnosis
+while verifying, because `elementFromPoint` returns the button rather than the node there.
+
+**`audit:ai` gained 13 checks**: the grab/grabbing cursors, selection suppressed only while
+panning, the node/control exemption, the touch bail, the primary-button test, the guarded capture,
+the imperative class, the unbounded pan, the fit scale still owning `.wf-tree`, the translate on
+`.wf-fit`, `overflow: hidden`, the dots reading the pan, the zoom anchor subtracting it, and Fit to
+view clearing it. ⚠️ **ONE EXISTING CHECK HAD TO BE RE-AIMED AND IT CAUGHT ITSELF:** it pinned the
+pan to `scrollLeft`, so it went red the moment the mechanism changed — which is the check doing its
+job, but the INVARIANT it asserted was the wrong one, because the video disproved the mechanism
+rather than the code drifting from it.
+**Verified with real drags at 1200px**: a drag of +221/+120 pushed the diagram right and down with
+bare canvas behind it and the dot grid travelling with it (`background-position: 221px 120px`)
+while the scroll offsets stayed 0 — something the old scroll-based pan could not do at all. No
+scrollbar on either canvas (0px gutter). A real click on a panned node still opened its own drawer,
+dragging FROM a node still changed nothing, zooming after a drag held its focal point to 3px, and
+Fit to view returned the pan and the dots to 0. **The voice canvas pans too and is otherwise
+untouched** — 12 nodes, 8px radius, 2px strokes, no arrowheads, no `.wf-v2`.
+
+##### The node's Action and the drawer's Action are one answer (9/17/2026)
+Reported against a node reading Inform whose drawer had Qualify selected: *"the 'Action' in this
+example Qualify, it should match the action in the context drawer."* Reproduced exactly before
+changing anything — **all eight template nodes agreed, and the two the SE had ADDED (`Test`,
+`Test 2`) read Qualify on the card and Inform in the drawer.**
+
+⚠️⚠️ **CAUSE: `smsDrawerFor` HAD TWO SOURCES OF TRUTH FOR ONE FACT.** The template's nodes are
+listed in the `SMS_QUALIFY` / `SMS_INFORM` id tables, and any id absent from both fell through to
+a fallback that **hardcoded `action: "inform"`** — so an added node's colour came from its own
+`actionKind` (the tint, fixed the day before) while its drawer came from a constant. The fallback
+now RESOLVES THE NODE FROM THE TREE and takes `node.actionKind`, falling back to the wording of
+its own `action` string, so the card and the drawer read the same field and cannot disagree. The
+id tables survive only as the fast path for the eight template nodes.
+⚠️ **AN ADDED QUALIFY'S ANSWERS ARE ITS OWN CHILDREN**, at `branches.B.leaves.L.paths.P.paths`
+derived from the id, so `Add` works there too rather than being a dead control. A **sub** node
+gets no segments path at all: it is the last row the diagram draws, so a child would be stored
+and never rendered.
+
+⚠️⚠️ **THE STORED-FIELD RULE THIS COST, AND IT IS GENERAL RATHER THAN ABOUT THIS SCREEN: A NEW
+FIELD MUST SIT AT A PATH WHOSE PARENTS ALREADY EXIST IN THE STORED OVERRIDE, OR WRITES TO IT ARE
+SILENTLY LOST.** `setByPath` refuses a missing INTERMEDIATE key (`if (!(k in cur)) return source`)
+and only ever creates the LAST segment, and `applyEdits` operates on the STORED override rather
+than the merged base. So `sms.extra.<nodeId>__question` wrote nothing on any demo whose override
+already had `sms` but no `sms.extra` — **Apply reported success, the drawer closed, and the text
+was gone on reload.** Flattened to `sms.extra__<nodeId>__<field>`, one level under a key that
+always exists; `SmsConfig` types it as ``[extra: `extra__${string}`]: string | undefined``. There
+is deliberately **no nested `extra` map** to walk into, and `audit:ai` asserts one is not
+reintroduced.
+⚠️ **AND READING IT MUST TOLERATE AN OVERRIDE SAVED BEFORE THE FIELD EXISTED.** Without the base
+spread under the stored config, one click on an added segment threw
+`Cannot read properties of undefined` — and because `DashboardBoundary` catches the render, the
+error tore down the whole diagram, so **EVERY node stopped opening**, not just that one. The
+drawer is handed `{ ...smsBase, ...(tree.sms ?? {}) }`.
+
+**`audit:ai` gained 6 checks** (51 for this feature): every node's drawer describes that node's
+own action INCLUDING an added one, an added Qualify's Add writes its own children, its text
+writes to a flat key, no nested `extra` map exists, `editGuard` allows the first write, and the
+base is spread under the stored config. ⚠️ Each was broken on purpose and seen to fire — and
+**one EXISTING check had to be re-aimed rather than loosened**: it asserted a READ-ONLY DRAWER for
+an id naming no node, which was the old fallback's behaviour, where the drawer now opens NOTHING
+at all. That is the stronger outcome and the one its own failure message already allowed; the
+invariant was never "a drawer appears", it is "no node borrows another node's write paths", and
+the re-aimed check was verified to still catch a borrowed path.
+
+**Verified in the browser:** all ten nodes now agree, an added node's question and fallback
+survive a reload, the page's undo removes them, and the SE's own `Test` / `Test 2` nodes are
+intact and reading Qualify on both the card and the drawer.
+##### The Action dropdown is real, and its five actions are five different drawers (9/17/2026)
+Asked for with five captures attached, one per option: *"These are all the actions, that the user
+can select from the drop down. Create these."* They are **Schedule Callback, Qualify, Inform,
+Inform & Route, Support & Escalate** — and they are not five labels over one shape.
+
+⚠️⚠️ **PROVENANCE, AND IT IS SPLIT: THE SHAPES ARE MEASURED, THE LIST IS A SCREENSHOT.** All five
+captures (`reference/agent-workflow/sms-action-*.html`) saved with the combobox **closed**
+(`aria-expanded=false` in every one), so no listbox markup exists anywhere and the option set and
+its ORDER come from the screenshot alone. The popup's geometry is that screenshot plus this app's
+own already-measured combobox popup (options 32 tall at `6px 16px`, 16/400, paper radius 3, the
+MUI shadow). Flagged rather than presented as measured, exactly as the Create Workflow channel
+combobox already is. What the captures DO give, verbatim, is each action's drawer:
+
+| action | prompt box | destination | Signal | What To Collect |
+|---|---|---|---|---|
+| **Schedule Callback** | **none at all** | none | **a FIXED chip, `SMS Scheduled Callback`, no "(optional)"** | yes, seeded **Consumer Name** |
+| **Qualify** | "What question…to qualify?" | none | **none** | **none** |
+| Inform | "How should the agent inform users?" | none | optional | yes |
+| **Inform & Route** | "…inform and route users?" | **"Where should the agent send users?"** | optional | yes |
+| Support & Escalate | "…handle escalation requests?" | "Where should the agent escalate unresolved users?" | optional | yes |
+
+⚠️⚠️ **QUALIFY IS THE ONLY ONE WITH NO SIGNAL AND NO WHAT-TO-COLLECT**, which reads as an
+omission until you see why: it is the BRANCHING action and the other four are terminal. And
+**Schedule Callback's Signal is not a field** — measured as a filled MUI info chip (20px tall,
+radius 100px, blue-100 `#11228c` on blue-20 `#b0cdff`, 12/16), because that action always fires
+that one signal, so there is nothing to choose. A `Record<ActionKind, string>` for the prompt
+would have forced a label to be invented for it, so the type is
+`Record<Exclude<ActionKind, "callback">, string>` and `actionCopy` returns `prompt: null`.
+
+⚠️⚠️ **CHANGING THE ACTION RESETS THAT ACTION'S FIELDS, AND THAT IS MEASURED RATHER THAN CHOSEN.**
+The same node, same Inform action, showed **eleven** collect fields when its drawer was opened
+fresh and **zero** once the combobox had been switched, with the instruction box back to its
+placeholder. So `collectOnSwitch` is a SEPARATE question from `COLLECT_FOR`: the latter is what
+our template configures per action (it drives the diagram's pills), the former is the product's
+default for a just-changed action — empty for four of them, Consumer Name for the callback.
+Conflating the two would make a switch to Inform silently inherit the template's zip+name list.
+⚠️ **IT DOES NOT RESTORE ON SWITCHING BACK**, which is also measured (Inform was the original
+action and still came back empty). Everything lives in the DRAFT, so Cancel is the way back and a
+mis-click costs nothing — verified: three switches then Cancel left the node exactly as it was.
+
+⚠️⚠️ **THE TINTS ARE DERIVED FROM THE PALETTE, NOT INVENTED — the capture's own titan variables
+close the system.** Every measured ink is its hue's `-100` token: Qualify purple-20 `#d0c1f2` /
+purple-100 `#440066`, Inform blue-50 `#2666f9` / blue-100 `#11228c`, Escalate orange-50 `#ff7045`
+/ orange-100 `#b33b00`. So Inform & Route is **teal-40 `#33e5c9` / teal-100 `#007e73`** — and
+`#33e5c9` is exactly what the Create Workflow capture independently measured for that action, two
+signals agreeing — and Schedule Callback is **green-50 `#2cbf58` / green-100 `#0d5400`**, which is
+also the green this repo already draws for a scheduling leaf.
+⚠️ **NO CAPTURE SHOWS A NODE CARRYING EITHER NEW ACTION**, because the dropdown was never applied
+in any of the five. The 8% / 12% / 5px treatment is measured; only the hue is placed by the
+palette. Replace if a capture ever shows such a card.
+⚠️ `actClass` **lowercases** now, so `informRoute` yields `.wf-act-informroute` rather than a
+camelCase selector nobody would grep for. A no-op for the three kinds that predate it.
+
+#### Three things that would each have shipped a silent defect
+⚠️⚠️ **1. THE ID TABLES SHADOWED THE NODE, AND IT WAS THIS MORNING'S BUG THROUGH A NEW DOOR.**
+Caught in the browser on the first working Apply: `sub-0-0-0-0` is listed in `SMS_INFORM`, whose
+fast path hardcoded `action: "inform"` — so a node switched to Schedule Callback **drew correctly
+and reopened as Inform**. The tables now stand down when the node no longer carries the action
+they were written for (`kindOfNode` outranks every one of them), and such a node falls through to
+the generic branch, where its text lives in the flat `extra__` keys. That is right rather than a
+compromise: `sms.inform.serviceableYes` is the wrong slot for an action with no instruction text
+at all. **Four audit checks catch this regression.**
+⚠️⚠️ **2. A LOCKED NODE MUST GET NO PICKER, AND THE GUARD COULD NOT HAVE STOPPED IT.**
+`editGuard.LOCKED_KEYS` matches a path ending in `.action`, but the action writes the containing
+ARRAY — so a locked leaf's action would have sailed straight past it. `actionSlotFor` refuses a
+node with `locked: true`, so there is no slot, no picker and no write, and the two chrome leaves
+keep the read-only combobox they were signed off with. Verified: "All Sales Inquiry Users" and
+"All Support Users" show a static combobox, a configurable node shows the picker. **Do not add
+another writer for a node's action without repeating that test.**
+⚠️⚠️ **3. THE WRITE REUSES THE ONE SHAPE ALREADY PROVEN HERE.** `edits.segments` has written
+`…paths` as a whole array of NODES since this drawer shipped, so the action change writes the
+containing array with the node spread and replaced. A per-field path like `…paths.2.action` sits
+one level deeper than anything the stored override is known to contain, and `setByPath` refuses a
+missing intermediate key **silently** — this morning's `sms.extra.*` bug wearing a different hat.
+Spreading also keeps the node's title, its lock and its own children by construction.
+⚠️ **A BLANK ANSWER IS NO LONGER WRITTEN AS A NODE.** Switching to Qualify shows two empty answer
+rows, as the capture does; without filtering them at Apply, browsing the dropdown would leave
+empty boxes on the diagram. It also fixes the pre-existing case of `Add` then Apply with nothing
+typed.
+⚠️ **CONSEQUENCE, STATED AND NOT MEASURED: switching a Qualify away from Qualify keeps its
+children.** The product very likely drops them, but no capture shows it, and silently destroying a
+configured subtree because somebody browsed a dropdown is the worse failure — the same stance
+"delete a tile HIDES it" already takes. The diagram will draw those children under a terminal
+action until this is settled by a capture.
+
+**`audit:ai` gained 22 checks** (73 for this feature): the five options and their order, each
+label, each new Description verbatim, Inform & Route's SMS prompt, callback having no prompt and
+no destination, its fixed chip and its seeded collect, the other four seeding none, the two
+destination wordings being distinct while plain Inform has none, a node's action text being the
+same VALUE as its drawer label for all five, a switched template node opening its own drawer, the
+wording fallback not swallowing "Inform & Route" into inform, a locked node getting no slot, a
+configurable node's slot resolving to its own position, the write going through the array, the
+picker being gated on having somewhere to write, the voice tables staying keyed on the three voice
+kinds, both tints being scoped titan values, the lowercased class, and all five captures being in
+the repo. ⚠️ Five were broken on purpose and each fired — restoring the table shadowing (4 red),
+un-gating the lock, reordering the list, emptying the callback collect, and merging the two
+destination strings.
+
+##### The VOICE workflow's drawers get the same treatment (9/21/2026)
+Reported: *"i dont see the updated stuff in the voice workflow — 1. updated context drawer 2. have
+the ability of add 3. action drop down"*, with one constraint: *"the one thing i dont want you to
+change is the actual tree that has been created."*
+
+⚠️ **THEY WERE READ-ONLY BECAUSE NOBODY HAD ASKED, NOT BECAUSE THEY COULD NOT WRITE.** The voice
+page has registered its `agent` half beside the tree since 8/27 — that is how Ask AI configures
+that agent — so the write targets already existed and only the drawers' `edits` paths were
+missing. `onApply` was passed for `smsTemplated` alone; it now also covers the built-in voice
+workflow, and still NOT an authored extra or a created one, neither of which has a config slot
+for a node the template never made.
+
+⚠️⚠️ **EVERY EDITABLE FIELD WRITES TO A HOME THE AGENT ACTUALLY READS.** That is the whole
+difference between this and a drawer full of controls that change nothing spoken:
+| field | home | reaches the call via |
+|---|---|---|
+| the Qualify question / reprompt | `agent.qualifyQuestion` / `agent.qualifyFallback` | `specWithConfig` |
+| a Qualify's answers (and `Add`) | the tree's own `paths` | `treeToVoicePaths` |
+| a use case's instruction | `agent.informSteps` | the CALL FLOW's steps block |
+| What To Collect | **the node's own `chips`** | `treeToVoicePaths` |
+| the escalation instruction | `agent.escalateHandling` (new) | the support line, both flows |
+
+⚠️⚠️ **THE ROUTING STEPS ARE ONE SHARED FLOW, NOT PER-NODE TEXT.** Every use case renders
+`spec.informSteps`, because there is one call flow and each use case follows it. So the edit goes
+to that one home — **consequence, stated: editing the instruction on one use case changes it on
+all of them.** A per-node copy would look perfect in the drawer and change nothing the agent says.
+
+⚠️⚠️ **THE ESCALATION INSTRUCTION WAS A LITERAL INSIDE `workflowDrawers.ts`**, so the drawer had
+been showing an instruction the PROMPT never carried — the drawer-describes-what-the-agent-does-
+not shape this file already records three times. It now has a home defaulting to the same wording
+(`DEFAULT_ESCALATE_HANDLING`, one definition shared by the drawer and the prompt), so an untouched
+agent is byte-identical.
+⚠️ **AND THE FIRST ATTEMPT PUT IT ONLY IN THE HARDCODED FALLBACK FLOW — which is emitted exactly
+when a prospect has NO use cases, i.e. for none of them.** The field would have been a dead
+control on every real workflow. Caught by reading the built prompt, not the diff; it now renders
+in the paths-driven flow too, and `audit:ai` counts both sites.
+
+#### Then: the last row's drawers described a different node (9/21/2026)
+Reported straight after, against a use case: *"all the context drawer in the last layer, all the
+fields are empty, it should match what is happening in the last layer."* Three things were wrong,
+and the first is the one that matters:
+1. ⚠️⚠️ **WHAT TO COLLECT WAS A GENERIC TABLE ON EVERY USE CASE.** The node drew "Consumer Name,
+   Service Address, Timeline" while its drawer listed `COLLECT_FOR.inform` — Consumer Zip,
+   Consumer Name. Two descriptions of one node, which is the pills failure this file records
+   already. `nodeCollect` reads the node's own chips, so the diagram, the drawer and the prompt
+   are one value; two different use cases now show two different lists.
+2. **THE INSTRUCTION BOX WAS BLANK, AND THAT IS USUAL RATHER THAN BROKEN.** `informSteps` is only
+   the service-area gate, so a prospect that serves everywhere has none — **measured: 10 of the 15
+   profiles on disk.** A bare empty box reads as a defect, so it carries a placeholder naming what
+   belongs in it, exactly as every SMS drawer does.
+3. **THE NODE'S DESTINATION IS STILL NOT SHOWN.** The card reads "Route to Service Appointment,
+   New Customer" and the drawer has no destination row. The measured voice drawer has a phone row
+   and no destination row, and **no voice drawer capture survives in `reference/`**, so adding one
+   would be inventing a control. Flagged rather than built.
+⚠️ Also open: "All Support Users" draws no chips while its drawer shows Consumer Name (the
+fallback for a node carrying none, and the prompt does collect a name there) — so the chip is
+arguably missing from the NODE. Left alone; it is the row above the one reported.
+
+⚠️⚠️ **THE TREE ITSELF IS UNTOUCHED, WHICH WAS THE CONSTRAINT.** Measured before and after: 12
+nodes, 15 chips, **zero** `.wf-v2`, **zero** arrowheads, 8px radius, its own green, 2px strokes,
+minimap present. Every edit was in the drawer builder, never the renderer, and two checks pin it —
+the SMS action tints stay scoped to `.wf-v2`, and `marker-end` stays opt-in (an ATTRIBUTE, so no
+stylesheet scope could keep arrowheads off another diagram).
+
+⚠️ **ONE FIELD IS STORED CORRECTLY AND IS CURRENTLY SILENT, AND IT IS A PRODUCT DECISION, NOT A
+BUG TO PAPER OVER.** `voiceQualify` is suppressed whenever the greeting already contains a "?",
+by the rule that stops the agent asking twice — and **every profile sampled has a greeting that
+asks**. So editing the Qualify question saves and changes nothing audible until the greeting stops
+asking. Pre-existing (Ask AI has had the same caveat since 8/27), but making the field editable
+turns a stale display into an edit that appears to do nothing. Raised with the user rather than
+guessed at; relaxing the suppression risks the double question the rule exists to prevent.
+
+**`audit:ai` gained 12 checks**: the voice drawers can Apply at all, both chrome leaves offer the
+picker, Add writes the tree's child nodes, the escalation has a home and reaches BOTH flows, one
+definition of its default, a use case's instruction writes the shared list AS a list, a use case's
+collect is its own node's chips, two use cases differ, the unset box names itself, the SMS tints
+stay scoped, and arrowheads stay opt-in.
+⚠️ Three were broken on purpose and each fired. ⚠️ **ONE EXISTING CHECK WAS RE-AIMED, NOT
+DELETED** — it asserted a voice drawer carries NO write paths, which was the old scope; it now
+asserts every write path goes somewhere the agent reads, which is the invariant that survives.
+⚠️ **AND TWO NEW CHECKS FAILED ON CORRECT CODE FIRST**, both fixture faults: one matched
+`lineFor(` where the declaration is `lineFor = (`, and one built its tree from `smsBranches`,
+whose path nodes carry no chips — so the per-node collect check compared against an empty list.
+`audit-voice.ts` already carries `auditTreePaths` for exactly this reason; use a real voice tree.
+
+##### The config is bi-directional: the workflow IS the agent's config (9/17/2026)
+Asked for directly: *"can we make the config bi directional, so if there are changes in the
+workflow, it also changes it in actual preview agent or preview workflow, and vice versa, if i use
+ask AI to make changes, it should make those changes in the workflow."*
+
+⚠️⚠️ **MEASURED FIRST, AND THE GAP WAS TOTAL: THE BUILT-IN SMS WORKFLOW REACHED THE AGENT
+NOWHERE.** `buildSmsBrain` read `agentConfig`, an extra workflow's own prompt and (for an extra
+workflow) its `wfAgent` half — so every field of the six-row template was invisible to the phone:
+three qualify questions, four inform instructions, the escalation text, both intents' looks-like
+and rules, every node's collect chips, the destination and the signal. An SE could configure the
+entire diagram and both previews would ignore all of it.
+⚠️ **THE VOICE PAGE ALREADY WORKED THIS WAY**, which is the pattern mirrored rather than invented:
+its call reads the WORKFLOW page's scope and merges `effTree.agent` into the spec. The mechanism
+for reading another page's scope was also already here — the Preview Agent has read an EXTRA
+workflow's scope since 9/8. The built-in one simply was not being read.
+
+⚠️⚠️ **NOT A SYNC BETWEEN TWO COPIES — ONE HOME PER FIELD, READ BY BOTH SURFACES.** Asked whether
+the overlap should be resolved by precedence, the answer was *"whatever was edited most recently"*.
+With one home that is automatic and needs no timestamps: the last write to the single value is what
+the agent uses, and neither surface can discard the other's edit. Two stores kept in step would be
+the duplicated-field trap behind all three of the 8/27 voice bugs. The store carries no timestamps
+at all, so the alternative would have meant persisting them into the demo record for a conflict
+that, with one home, cannot arise.
+
+**What has which home, measured rather than assumed:**
+| | home | overlap |
+|---|---|---|
+| the three qualify questions, four inform instructions, escalation text, both intents, each node's collect list, destination, signal | the **workflow** (`sms.*` + the tree) | — |
+| greeting, brand rules, goal, booking type, offer, Q&A, knowledge | the **agent** (`agentConfig`) | — |
+| the qualification script (`smsPlaybook.qualifyingQuestions`) | the agent | **complementary, not duplicate** — the tree's questions ROUTE, the script QUALIFIES |
+
+⚠️⚠️ **IT IS DERIVED THROUGH `smsDrawerFor`, NOT BY A SECOND WALK OF THE CONFIG.** That function
+already knows where every node's text lives — the template's tables for the eight it configures,
+the flat `extra__` keys for anything switched or added — so the agent is told, by construction,
+exactly what an SE reads in the drawer. A second derivation is how the two come to disagree.
+
+⚠️⚠️ **THE WORKFLOW ENRICHES THE SALES FLOW; IT DOES NOT REPLACE IT, AND THE WORDING HAS TO SAY
+SO.** The generated SMS prompt is a SALES arc (open, qualify, estimate, schedule, confirm); the
+workflow is a ROUTING flow. Declaring "THIS SECTION WINS" beside it, the way `overrideBlock` does
+for a hand-written playbook, gives one conversation two competing flows — the self-contradicting
+prompt this file already records twice. And replacing the sales arc outright would turn EVERY
+prospect's SMS demo into a routing conversation, losing the qualify-quote-book beat that is the
+point of the channel. The block says outright that it does not replace the flow above and that a
+question appearing in both is asked once. `audit:ai` fails if it starts claiming precedence.
+
+⚠️⚠️ **AND NOTHING IS ASKED TWICE — the same bug this file already records for voice** ("the voice
+agent was re-asking ZIP and name": the service-area check and the path's collect list were two
+blocks nobody reconciled). The workflow's nodes collect a zip and a name, so feeding the script in
+untouched reproduces it on SMS. `dedupeQuestions` drops a scripted question only when the workflow
+demonstrably gathers that same datum — measured on Aptive, 5 questions to 4, the ZIP one dropped
+and the four genuinely distinct ones (pests, size, interior/exterior, timeline) kept. Conservative
+and structural, never semantic, exactly like `dedupeCollect`.
+
+#### The reverse direction: Ask AI on the Preview Agent edits the workflow
+`Scope.linkKey` / `linkAs` name another scope a page's Ask AI may also edit. The model is shown
+that scope's data under the prefix, and `routeEdits` strips the prefix and applies those edits to
+**that** scope — so an instruction typed into the Preview Agent moves the DIAGRAM instead of
+storing a second copy of a question beside it.
+⚠️ **THE TEXT FIELDS ONLY, WHICH IS NARROWER THAN THE "reword + add answers" THAT WAS ASKED FOR,
+AND DELIBERATELY SO.** `sms` carries every question, fallback, instruction and intent, so "ask
+about termites first" reaches the node an SE would have typed it into. `branches` is NOT exposed:
+a second page with structural control can change the tree's DEPTH, and the six-row geometry has no
+row to draw a seventh in, so those nodes would be stored and never rendered — the silent no-op
+this file keeps recording. Restructuring stays on the workflow page, where the diagram is on
+screen while you do it. **Say so rather than implying the wider version shipped.**
+
+#### Three defects found while building it, two by reading and one in the browser
+⚠️⚠️ **1. `registerScope` DROPPED THE LINK SILENTLY.** Its body builds the active scope object
+field by field, so a new field has to appear TWICE — in the equality test and in the object — and
+omitting the second half type-checks perfectly while the drawer receives `undefined` forever.
+Caught by reading that function rather than by the compiler. The check pins both halves.
+⚠️⚠️ **2. THE 12,000-CHARACTER CONTEXT CAP ATE THE WORKFLOW, AND A SLICED JSON IS MALFORMED
+JSON.** Caught in the browser on the first real Ask AI request: the payload came out at exactly
+**12,012** characters — the cap plus its marker — so the `workflow` half, appended last, was cut
+off entirely and the model was handed an unterminated object. It could not have edited what it
+could not see, and the failure looks like the feature not working. Raised to 40k (Aptive's agent
+config alone is ~12KB of prose, so pages were already being clipped before anything was folded
+in), and it now degrades by **dropping the linked half first**, so what remains is always valid
+JSON about the page's own data.
+⚠️ **3. A CHECK THAT COULD NOT FAIL.** The router's first check grepped for "does a router
+exist" and passed against a router edited to route nothing. `routeEdits` was extracted as a pure
+function so the audit calls it with real batches — including `workflowNotes`, which must NOT be
+stolen by a `workflow` prefix.
+
+**`audit:ai` gained 24 checks** (115 for this feature): the flow derives and carries each node's
+question, action, instruction and collect list three rows down; both intents' copy reaches it;
+editing a node moves what the agent is told; it reaches the brain and the prompt; an EXTRA workflow
+gets none of it; a brain with no workflow builds the old prompt byte for byte; the block does not
+claim precedence; the dedupe drops a covered question and keeps every distinct one; one definition
+of the scope key read by both previews; an empty workflow still gets no flow; `registerScope`
+carries the link in both places; `routeEdits` strips and routes, respects a page with no link, and
+needs the dot; and the context cap fits the workflow and degrades by dropping it.
+⚠️ Six were broken on purpose; four fired immediately and **two were presence-greps that did not**
+— both were rewritten, one into the real-function test above. ⚠️ One EXISTING check had to be
+re-aimed: it pinned `buildSmsBrain(profile, ac, wf, wfAgent)` exactly and went red the moment a
+fifth argument arrived. The arity was never the invariant.
+
+**Verified in the browser, by reading the `/api/chat` REQUEST BODY rather than trusting a drawer**
+— the test this file insists on. Editing "All Sales Inquiry Users" to *"Before anything else: are
+you dealing with termites?"* through the real drawer put that string in `brain.workflow` on BOTH
+previews: Preview Workflow on the same page, and the Preview Agent tab reading it across the page
+boundary. Then the reverse: Ask AI on the Preview Agent, asked to change the first qualifying
+question, wrote **`sms.qualify.root.question` into the WORKFLOW's scope** with **no copy in the
+preview's own scope**, and the diagram's drawer opened showing the new question. The page's undo
+took every step back and left no override behind.
+
+##### Every field in an action drawer is editable, and the dropdown is on all of them (9/17/2026)
+Asked for with **both LOCKED chrome drawers selected**: *"you need to add the drop and the screen
+to any action context drawer, any time its a action drawer with that drop it should have those
+screen and options, and make sure all those fields in the drawer is edititable as well."*
+
+⚠️⚠️ **THIS DELIBERATELY RELAXES THE LOCK, AND ONLY FOR THE ACTION.** The build an hour earlier
+refused a `locked` node a picker, on the strength of the standing rule that the four chrome boxes
+cannot be edited. That rule is about their **NAMES** — which is what was actually reported in
+August, against the box titles — and `editGuard` still refuses `.title` and `.subtitle` on them.
+Their ACTION is configuration, and on this instruction it is the SE's to change. **Consequence,
+stated: `editGuard.LOCKED_KEYS` covers `.action` and cannot see this write**, because it matches a
+path ending in `.action` while the write is the containing ARRAY — so that half of the lock now
+lives in `actionSlotFor` rather than in the guard. The audit check written an hour before this was
+**re-aimed rather than deleted**: it now asserts the picker IS offered on a locked leaf and that
+the leaf's name is still refused, so both halves stay watched.
+
+⚠️⚠️ **THE DESTINATION IS A TEXT INPUT, AND WE HAD INVENTED A COMBOBOX FOR IT.** The table above
+said "an empty combobox" and we rendered `Select a destination...`. The markup says otherwise in
+**both** the original capture and all five Action ones: `<input name=destination type=text>`,
+disabled in the configured captures and enabled in the switched ones, carrying
+`e.g. https://yourwebsite.com/support or +1-800-555-0100` (and `…/signup…` for Inform & Route).
+A URL or a phone number is what you type rather than pick, which is also what makes sense of the
+placeholder. Corrected, with the placeholders measured per action.
+
+**The other two were real autocompletes whose option lists are not in any capture** — both saved
+closed (`signal-select`, `addInfoField-select`) — so they come from the PROSPECT, the way
+everything else on this page is derived:
+| field | options |
+|---|---|
+| Signal | that prospect's **own signals**, off the Signal Manager list (Aptive: 10). A prospect with no `signalManager` slice offers **none** rather than an invented set, and the list says "Nothing to choose from" rather than rendering an empty box |
+| Add Info Field | the SMS **collect pool**, plus `Consumer Name` — which is not in the pool (that splits first and last) but IS what the Schedule Callback capture shows seeded, with its own help text |
+
+⚠️⚠️ **THE COLLECT LIST *IS* THE NODE'S `chips`, AND THE FIRST BUILD GOT THIS WRONG IN THE WAY
+THIS FILE ALREADY WARNS ABOUT.** Stored under its own `extra__…__collect` key it worked in the
+drawer and **the diagram's pills did not move** — two sources for one fact, exactly "a node
+advertising collecting one thing while its drawer's What To Collect said another". `chips` is
+already what the diagram draws and already exempt from the array-length rule, so it is now what
+the drawer reads and writes too, through the same `actionSlot` array write the action uses. One
+value, one place; the `editGuard` pattern added for the retired key was **reverted rather than
+left as a dead rule**, and the audit fails if either comes back.
+⚠️ **EACH CHIP'S × IS A REAL BUTTON NOW.** It was drawn from the start and did nothing — the
+dead-control shape this repo keeps paying for. An already-added field is also not offered again,
+since the same field twice on one node is not a state the product can mean.
+
+⚠️ **ONE `Combo` COMPONENT SERVES ALL THREE PICKERS**, because all three are the same MUI
+autocomplete in the capture and three copies would drift on the first fix. One `openCombo` id
+rather than three booleans, so opening one list closes the others — and **all three close on
+pick**, which the signal one did not until a browser test caught it leaving its list open.
+⚠️ Switching the action resets the destination, the signal AND the collect list with the rest,
+since all three are that action's configuration.
+
+**`audit:ai` gained 18 checks** (91 for this feature): both destination placeholders, the invented
+combobox being gone, each of the three having somewhere to write on a flat key whose parent
+exists, the signal options being the prospect's own and empty for a prospect with none, the
+collect list writing the node's chips, no dead guard pattern, a template node keeping its
+configured fields and help text, the × being real, no duplicate offer, `Consumer Name` being
+offered, one `Combo`, every picker closing on pick, and one open-picker id.
+⚠️ Five were broken on purpose and each fired: storing collect apart from the pills, inventing
+signal options, making the × decorative, allowing a duplicate, and nesting the destination path.
+⚠️⚠️ **AND ONE NEW CHECK FAILED ON CORRECT CODE — the fourteenth probe fault here.** It forbade
+`Select a destination...` and reddened on **its own comment** recording the correction. `readCode`
+now strips comments before matching, the same fix `audit:place` and the vendor scan already carry.
+
+**Verified in the browser with real interaction**: both of the selected locked drawers now show
+the picker with **zero inert comboboxes** — "All Sales Inquiry Users" with all five inputs
+editable, "All Support Users" with three pickers and a real destination input carrying its
+measured placeholder. On the support leaf: the signal list offered Aptive's own 10, the info list
+offered 9 then **8** (the added one filtered out), the destination took typed text, Apply moved
+the **node's pills** to match, and all of it **survived a reload**; the × removed a field and
+Apply took the pills with it; the page's undo walked every step back to the template with **no
+leftover keys**. The template's own Inform drawer still renders its 8 configured fields with their
+help lines and its configured instruction text, with the node's pills still capped at 4 + `...`.
+**Untouched and checked: the voice drawers** — 0 pickers, every combobox static, every input
+read-only, no chip ×.
+
+**Verified in the browser with real clicks**, at 1446px on Aptive: the list opens with all five in
+order at 32px/`6px 16px`/16px with Inform marked selected, a second click on the trigger CLOSES it
+(the capture-phase handler doing its job), picking Schedule Callback rerenders the drawer to its
+measured shape (zero textareas, `Signal` with no "(optional)", the chip at 20px/100px in
+`#b0cdff`/`#11228c`, Consumer Name prefilled), and Apply turned "Serviceable=true" green
+(`5px solid rgb(44,191,88)`, 8% ground, `rgb(13,84,0)` ink) with its chips reset to Consumer Name.
+It **survived a reload and reopened as Schedule Callback**, the page's undo restored it to Inform
+with all four chips and the `...` cap, and Cancel discarded three switches. The other three shapes
+each render their own measured fields. **Untouched and checked: the voice tree** — 12 nodes, no
+`.wf-v2`, no arrowheads, **no picker on any drawer**, and its voice-only phone row still reading
+"What phone number should unresolved callers be transferred to?".
+
 ### ⚠️ THE SMS WORKFLOW'S FOUR NODE NAMES ARE FIXED, AND LOCKED (8/24/2026)
 The real Invoca page does not let a user rename them, so the template must not either. They
 are always **"Triggered by"**, **"Conversation Start"**, **"Sales Inquiry"** and
-**"Need Support"** for every prospect, plus the support leaf **"All Support Users"** and the
-trigger line **"0 Campaigns, 0 Forms, and 0 Inbound SMS"**.
+**"Need Support"** for every prospect, plus the support leaf **"All Support Users"**.
+❌ **THE TRIGGER LINE THIS SECTION PINNED IS SUPERSEDED (9/17/2026).** It read "0 Campaigns, 0
+Forms, and 0 Inbound SMS", which is right for a workflow nobody has wired and is still what
+`ZERO_TRIGGER` gives a CREATED one. The built-in template now carries the captured line for a LIVE
+SMS workflow — **"0 Campaigns, 2 Forms, and 1 Inbound SMS"** (`SMS_TRIGGER`). See the section
+above. The four NODE NAMES are unchanged and still locked.
 
 ⚠️ **TWO OF THE FOUR WERE NEVER AT RISK** — "Triggered by" and "Conversation Start" are
 literals in `WorkflowTree.tsx`. The INTENT names were being derived from each prospect's own
@@ -1223,6 +2265,71 @@ full page reload. **Untouched:** the Definition tab (12 nodes, 15 chips, canvas,
 toolbar all present, **zero `.wfd-` elements**) and the SMS workflow's own tab (Channel SMS, its
 own trigger line, no voice picker, no dead controls). `audit:ai` and `audit:phases` green, `tsc`
 clean on both projects.
+
+#### The picker shows the voice's NAME ONLY — no vendor, no model (9/16/2026)
+Asked for directly against the Agent Voice dropdown: *"remove the vendor name and just keep the
+Name of the voice."* So "Thalia (Deepgram Aura 2)" is now **"Thalia"**, and the same for all six.
+
+⚠️ **A DELIBERATE DEPARTURE FROM THE SCREENSHOT, which the note above is otherwise strict
+about.** Two reasons it is the right one to make: all six voices are Aura-2, so the suffix was
+six identical parentheticals carrying no information an SE chooses between; and a third party's
+brand on a control clicked in front of a prospect invites a question the demo is not about.
+
+⚠️⚠️ **DISPLAY ONLY, AND THAT IS WHAT MAKES IT SAFE.** `VoiceOption.label` has exactly three
+readers, all in `AgentWorkflowDetails` (the `<option>` text and the play button's title and
+aria-label). Everything that decides what the agent SOUNDS like keys off `id` — what is stored
+on `agent.voice`, what `engine/voicePreview.ts` allow-lists, what `liveKitVoiceModel` builds
+`deepgram/aura-2:<id>` from, and what `mintVoiceToken` puts in the dispatch metadata. Verified
+with a real pick: choosing Arcas stored **`arcas`**, not the label, and the play button followed.
+⚠️ **THE REQUEST CONTRADICTED ITSELF AND THE INTENT WON.** It also said *"just do Deepgram"* —
+which IS the vendor, and would have rendered six identically-labelled options. Flagged in the
+reply rather than implemented.
+⚠️ **STILL SHOWING THE VENDOR, ONE LINE BELOW: the character note.** Thalia's reads "…—
+Deepgram's own pick for casual chat and IVR", and it renders directly under the picker. It is
+`VoiceOption.note`, not the dropdown, so it was left alone rather than quietly widening the ask;
+raised with the user.
+
+#### Then: the vendor is gone from every RENDERED surface (9/16/2026)
+Asked for straight after: *"remove deepgram wording for everywhere."* Swept the whole repo and
+classified every hit, because "everywhere" cannot mean the model string — see below.
+
+**Changed, because a user sees it:**
+| | |
+|---|---|
+| `VoiceOption.note` (Thalia) | "…— **Deepgram's own pick** for casual chat and IVR" -> "…— made for casual chat and IVR". It renders directly under the picker, so stripping only the labels had left the vendor two lines beneath the control it was just removed from |
+| `public/readme.html` | the `DEEPGRAM_API_KEY` / `ELEVENLABS_*` env rows, **which were also STALE** |
+| `README.md` | same row, same staleness |
+
+⚠️⚠️ **THOSE DOC ROWS WERE WRONG AS WELL AS VENDOR-NAMED, which is why removing them is a fix
+rather than a redaction.** Both vendors were deleted on 9/3 — `engine/tts.ts` is gone, `/api/tts`
+404s, and `audit:voice` already asserts neither key is read anywhere — yet the in-app Read.Me
+page (served at `/readme.html`, opened from the launch menu) still documented them as "For
+voice, pick with `TTS_PROVIDER`". `ARCHITECTURE.md`, the markdown source of truth, had already
+been corrected; the HTML had drifted from it for two weeks.
+⚠️ **AND REMOVING THEM LEFT THE VOICE ENGINE UNDOCUMENTED**, so a `LIVEKIT_URL` +
+`LIVEKIT_API_KEY` + `LIVEKIT_API_SECRET` row replaces them — the table had **zero** LiveKit rows
+before. Deleting the only voice vars and leaving a gap is a worse doc than the stale one.
+
+⚠️⚠️ **NOT CHANGED, AND THE FIRST ITEM IS LOAD-BEARING: `deepgram/aura-2:<voice>` IS THE WIRE
+FORMAT.** `LK_MODEL`, `agent/voiceAgent.js`'s `TTS_MODEL` / `STT_MODEL`, the dispatch metadata
+and every audit assertion over them stay exactly as they are. It is a MODEL NAME inside
+LiveKit's inference gateway, the way `claude-haiku-4-5` names a model — we hold no credential
+for it — and this file already records that a bare `deepgram/aura-2` names NO voice, so dropping
+the provider prefix is a call that connects and never speaks.
+⚠️ **Code comments, `CLAUDE.md`, `ARCHITECTURE.md` and the audit's own scan messages keep the
+word too.** Those explain why the vendors are gone and assert they stay gone; this file already
+records the lesson that the vendor scan had to strip comments first because *"a check that
+reddens on a correct file gets deleted as a nuisance"*. Redacting the record would make the next
+reader re-derive it.
+
+**`audit:voice` is 119 checks** (was 117): no voice **label** and no voice **note** may carry a
+vendor or model name (`deepgram|aura|livekit|eleven labs|cartesia|rime|inworld|fish audio`) —
+one shared `VENDOR` pattern, so the two cannot drift. Each was verified to FIRE by putting the
+old string back. The pre-existing "each label names its own voice" check still holds, because a
+bare name still starts with its own id.
+**Verified in the browser:** the Details tab's whole `innerText` matches no vendor at all, and
+the in-app Read.Me's Technical-detail tab shows the LiveKit row with no `TTS_PROVIDER` and no
+vendor key.
 
 ### A booked call creates the Salesforce Lead, and the Calendar chip opens it (9/3/2026)
 Asked for directly: *"which the voice agent books the appointment and it shows up in salesforce
@@ -1698,6 +2805,264 @@ nurture tree (now rendering correctly through the locked-chrome restructure from
 the built-in SMS tree (Consumer Name / Rolex, 2 chips, unaffected, still one line), and the voice
 tree (unaffected, wrap was already there). `audit:ai` and `audit:voice` (62) both green; `tsc`
 clean.
+
+### Orlando Health's five ER messaging workflows, and Ask AI reaching an SMS agent (9/8/2026)
+Asked for with a doc attached: *"Create a new workflow for each of the scenarios just for Orlando
+Health, make sure the Tree matches, similar to the logic in the voice ai trees. and make sure
+preview agent and preview workflow does what the scenarios says. Also make sure the Ask AI
+performs the same way the Voice AI workflow does."* Source: **"Orlando Health - AI Messaging
+Scenarios for Demo Video"**, the sign-off doc for the video, five scenarios with transcripts.
+
+**Five `reports.extraWorkflows` entries on the BUNDLED profile** (`src/data/generated/orlando-health.json`,
+which is in git), so they travel with the demo and reach the live site through a push rather than
+a PATCH. That is the opposite of the Avi & Co case: those live in `.data/demos`, which is
+git-ignored, because Avi & Co is a library demo. **Check which store a prospect is in before
+authoring anything.**
+
+| slug | scenario | trigger | use cases |
+|---|---|---|---|
+| `sms-er-still-waiting` | 1, still waiting at ORMC | wait over threshold | 3 sales + 1 support |
+| `sms-er-lwbs-pcp` | 2, left without being seen, refer to primary care | LWBS in Epic | 2 + 1 |
+| `sms-er-lwbs-care-now` | 3, still needs care now | LWBS in Epic | 2 + 1 |
+| `sms-er-warm-handoff` | 4, context travels to the call center | asks for a person | 1 + 2 |
+| `sms-er-new-vs-existing` | 5, new versus established patient | LWBS, Epic record checked | 3 + 1 |
+
+Every `openingMessage` is the doc's own outbound text VERBATIM, minus the "Orlando Health:"
+sender label the doc uses to mark who is speaking. Scenario 5 keeps `{name}` as a token
+(`resolveGreeting` resolves it off the voice screenpop's caller, so it renders "Hi Michael…").
+The doc's five ground rules are in every `systemPrompt`, not spot-checked on one, and
+`audit:ai` asserts each of the seven on all five.
+
+#### `ExtraWorkflow.playbookSteps` — the ordered flow, as a LIST
+⚠️⚠️ **THE WHOLE REASON IT IS A LIST AND NOT MORE PROSE.** `systemPrompt` is one blob: a model
+asked to "confirm the facility first" has to rewrite the whole thing, and `editGuard` sees one
+giant string diff rather than a list whose length is its content. The voice page settled this
+shape already, `agent.informSteps` is a `string[]` and is why "drop the step that asks for a
+name" works there. Rendered by a new `stepsBlock()` in `engine/chat.ts`, **numbered, with "do
+not skip, do not reorder"** copied from step 2 of the main flow: a bulleted list of steps reads
+to the model as a MENU, which is the exact mistake this file records against the Preview Agent's
+questions.
+⚠️ **NEVER AUTHOR BOTH.** Put a workflow's flow in `playbookSteps` OR in the prose, not both, or
+the prompt carries two orderings of one flow and the model picks one. Avi & Co and Reyes Law
+carry theirs in prose and set no `playbookSteps`, so nothing is appended and their prompts are
+byte-identical, which `audit:ai` pins.
+⚠️ **IT IS SKIPPED BY THE DASH SWEEP**, and it needed its OWN constant to be. `systemPrompt`
+earned that exemption on 9/2 because it is instructions to the model and never shown to a
+prospect, and this is the same thing; but the object walk skips a `SKIP_KEY` **only when the
+value is a string**, so an array keyed `playbookSteps` was recursed into and swept step by step.
+`SKIP_LIST_KEY` + `isSkipped()` handle the list form. Kept separate rather than widening the
+guard to arrays, because `path` and `range` are also in `SKIP_KEY` and could hold an array
+somewhere.
+
+#### Ask AI on an SMS workflow now configures the agent, exactly as the voice page does
+⚠️⚠️ **BEFORE THIS, AN SMS EXTRA WORKFLOW REGISTERED ONLY ITS DIAGRAM.** So "open with X" or
+"confirm the facility before offering anything" had nowhere to land: the model wrote the edit,
+`applyEdits` found no such path, and the drawer reported success. Sixth instance of the silent
+no-op in this file, and the same gap the voice page closed on 8/27.
+
+`AgentWorkflow` now merges `agent: smsWorkflowAgentOf(extra)` into the SAME registered object as
+the tree (never a second `usePageData`, which is last-write-wins and would repoint the page's
+sparkle off the diagram).
+
+| lives in | fields |
+|---|---|
+| the **tree** | intent subtitles, leaf titles, use-case titles, chips |
+| **`agent`** | `greeting` (the workflow's `openingMessage`), `steps` (its `playbookSteps`) |
+
+⚠️ **`rules` AND `questions` ARE DELIBERATELY NOT IN IT.** They already have a home, the
+prospect's `brandConversationRules` and `smsPlaybook.qualifyingQuestions`, edited on the Preview
+Agent page and reaching a custom-playbook workflow through `overrides`. A second home for one
+field is the duplicated-field failure behind all three of the 8/27 voice bugs.
+
+⚠️ **THE EDIT HAS TO CROSS A TAB BOUNDARY, and that is the part that could have been a no-op.**
+Preview Agent opens at `/agent-studio/agent/preview?wf=<slug>`, a different page, so it rebuilds
+the workflow page's key via `smsWorkflowScopePath(slug)` and reads it with `effectiveData`
+(registers nothing). Overrides are persisted to localStorage, which is what makes a value
+written in the other tab visible at all. ONE definition of that path string, because the page
+writes it and another page reads it, and two copies is how one of them ends up reading a key
+nobody writes. `WorkflowChatPreview` gets the same half handed down as a `wfAgent` prop, since
+it is on the page and may not register a scope.
+
+⚠️ **PRECEDENCE IS `smsPlaybook.greeting` -> `wfAgent.greeting` -> `wf.openingMessage`.** The
+middle one's BASE is the authored opener, so an unedited workflow resolves to the same string as
+before. Putting `wfAgent` first would have re-created the 9/3 bug: a workflow-side value
+outranking a greeting a human explicitly set.
+
+#### Three things found by looking, not by a test
+1. ⚠️⚠️ **THE DRAWER SHOWED A LINE THE AGENT NO LONGER SENDS — defect 3 of the 9/3 report, back
+   through a new door.** With the opener edited on the workflow page, the phone's first bubble
+   read "Hi Michael, Orlando Health here…" while the drawer's OPENING MESSAGE row still showed
+   "Hi Michael, this is Orlando Health…". `greetingFallback` was `wf?.openingMessage`, the RAW
+   value, and it is now `wfAgent?.greeting ?? wf?.openingMessage`. The 9/3 check had to be
+   WIDENED (it required `greetingFallback:` immediately followed by `wf?.openingMessage`) and
+   the strict half moved to its own assertion.
+2. ⚠️ **THE AGENT MINTED A PHONE NUMBER.** Asked to refer a patient, it produced "Call Orlando
+   Health scheduling at 321-841-5111" — plausible, unverifiable, and headed for a demo video.
+   The doc writes "Call [number]" and leaves it to us. Ground rule 8 now pins **407-303-5910**,
+   which is Orlando Health's own callback number ELSEWHERE IN THIS DEMO (a call transcript in
+   `conversationIntelligence`), so it is derived rather than invented, and forbids inventing a
+   number, address, provider or facility.
+3. ⚠️ **THE DECORATIVE MINIMAP SAT ON THE LAST NODE OF A FOUR-COLUMN SMS TREE.** Measured at
+   1440x1000: `sms-er-new-vs-existing`'s "Clinical or Emotional Reply" and its action text were
+   both under the minimap's box, while a 3-use-case tree cleared it. **So it has been true since
+   9/2 for Avi & Co's `sms-new` and Reyes Law's `sms-nurture`, both four-branch.** `app.css`
+   already hides this element on the voice canvas with the note "Voice tree is taller, so it
+   doesn't overlap the leaves", so `.wf-canvas-tall` does the same for an SMS tree that has a
+   USE-CASE row. **The condition is the fourth row, not a column count** — keying off a
+   threshold would put hardcoded geometry back into the component that exists to compute it. The
+   built-in SMS tree, the Comfort Keepers override and a created workflow all have leaves with
+   no `paths`, so none of them changes.
+
+#### ⚠️⚠️ THE TREE HAD NO SYMMETRY, AND BOTH HALVES WERE ONE ROOT CAUSE (9/8/2026)
+Reported the same day, against these five pages: *"There isnt any symmetry, in the branch in the
+tree diagram. for example 1. Sometimes the sales Inquiry branch is different length to the Need
+support. or the the branch line is too close to the Conversation Start box."*
+
+**`GEO`'s row constants are FIXED while node heights are MEASURED, so every gap in the diagram
+was `(a constant) − (however tall the text above made the row)`.** Measured across the seven
+Orlando Health workflow pages before touching anything:
+
+| | stub under Conversation Start |
+|---|---|
+| the two whose `startLabel` wraps to a second line | **4px** |
+| the five that fit one line | 23px |
+| the voice tree | 73px |
+
+One workflow away from a third line it would have **inverted and pointed upwards**, which is the
+failure the note at the top of `FALLBACK` already records for a hardcoded offset. And the second
+half is the same arithmetic one row down: the built-in SMS tree's sales leaf measured **142px
+against the support leaf's 75px** because it carries two chips, so the two branches genuinely
+were different lengths.
+
+**Two fixes, and both were needed — the first alone does nothing for the second.**
+
+1. **`rowLayout()` places every row at `max(its constant, the row above + MIN_GAP)`**, with
+   `MIN_GAP = 30` (the product's own bus-to-intent drop, which was written as `g.intent - 30`).
+   ⚠️ **ONE SHARED, ACCUMULATED SHIFT, NOT A `max` PER ROW — and the per-row version was the
+   first attempt.** Clamping each row independently fixed the crowding and then ate the NEXT
+   gap instead: the intent-to-leaf stem came out 54px on five workflows and **35px on the two
+   whose subtitle wraps**. Symmetric within a tree, still ragged across the list of them.
+   Accumulating one shift and applying it to every row below preserves each variant's designed
+   gaps, because a row that has to move takes everything under it along.
+   ⚠️ **MONOTONE, WHICH IS WHY NO SIGNED-OFF DIAGRAM MOVED.** A row only ever moves DOWN.
+   Verified: the voice tree is byte-identical (its 103 / 73 / 100 gaps all clear MIN_GAP
+   already, so the shift stays 0) and the built-in SMS tree's bus and intent row move 7px,
+   which is that bus finally clearing the box by 30.
+   ⚠️ **ONLY ASK IT ABOUT ROWS THE TREE ACTUALLY DRAWS.** `rowAt` mutates the shift, so
+   querying the sub-bus on a tree with no split grew it by 13px and pushed every row below
+   down for a bus that is never rendered. Caught in the arithmetic, not on screen.
+
+2. **`levelRow()` gives every node in a row the tallest one's height**, so a row has ONE bottom
+   and every stem leaving it is the same length by construction. The height state collapsed
+   from `intents: number[]` + `leaves: Record<string, number>` to scalars; those per-node
+   lookups existed only to cope with the raggedness.
+   ⚠️ **IT CLEARS `minHeight` BEFORE MEASURING, AND THAT IS THE WHOLE TRICK.** Reading
+   `offsetHeight` with the previous pass's levelling still applied returns the level, not the
+   content, so the row could only ever GROW: Ask AI dropping a chip would leave every box
+   stranded at the old height with dead space, and nothing on screen would say why.
+   ⚠️ **THE HEIGHT IS WRITTEN IMPERATIVELY, NOT THROUGH THE `style` PROP.** Rendering it means
+   React re-applies it next commit and the effect clears it the pass after — and when the
+   measurement is unchanged `setH` bails, React does not re-render, and the row is left CLEARED
+   and ragged on screen. Ending the layout phase with the value applied is what guarantees the
+   painted frame is levelled.
+
+**Consequence, stated: the last row of every diagram is now level.** The built-in SMS tree's
+support leaf grows from 75 to 142 to match the sales leaf, and the voice tree's six use cases
+all sit at 162. That is the change the report asked for, and it reaches every prospect. The
+strongest evidence it is right is the product's own empty-workflow capture, which measures both
+user-group leaves at **248 x 72** and both intents at **248 x 46** — a uniform row.
+
+#### `workflowRows.ts`, and 30 more audit checks that sweep instead of sampling
+`GEO`, `MIN_GAP` and `rowLayout` moved into `src/data/workflowRows.ts` — a pure module with no
+JSX and no React, for the two reasons `workflowChrome.ts` is one: node can call `rowLayout`
+directly, and exporting a plain function from `WorkflowTree.tsx` breaks that file's fast refresh
+(`oxlint`'s `only-export-components`, which this repo already carries three of).
+
+`audit:ai` (129 checks, up from 76) now sweeps `rowLayout` over **10,368 height combinations** (six box heights from one
+to five lines plus an absurd 400, across both variants and with and without the sub-bus and the
+path row) and asserts that **no connector inverts and none is shorter than 30**. Plus:
+monotonicity, the voice tree's six row constants pinned to their captured values, and that
+`levelRow` still clears before measuring. **Verified to fire**: reverting `busY` to the constant
+turns up 5,904 inverted connectors and a −628px line; removing the clear, moving a voice
+constant, and putting a per-node row bottom back each turn one red.
+⚠️ Two probe faults again, both from this file's own catalogue. One check read the row
+arithmetic out of `WorkflowTree.tsx` after it had moved to `workflowRows.ts`, and reported a
+defect that did not exist. And the first sabotage attempt (`intentBottom = intentTop + h.intent
++ 0`) still satisfied the regex, so the check LOOKED like it had failed to fire when the test
+was the thing at fault.
+
+#### The five workflows' own copy got shorter, for a measured reason
+⚠️ **LEVELLING A ROW COSTS HEIGHT, AND THE FIT HAS A 0.5 FLOOR.** With the row levelled to its
+tallest card, `sms-er-new-vs-existing` grew past the floor at 1180x780 and the canvas started
+scrolling where it had fitted at 0.5015 — that margin was already nothing. Eleven actions and
+titles that wrapped to a second line were shortened ("Refer to Primary Care and Hand to
+Scheduling" to "Refer to Primary Care", "Route to Patient Financial Services" to "Route to
+Patient Billing"), and the three `startLabel`s over 29 characters were cut to under 27 so the
+Conversation Start box stays one line and the shift stays at 7. Better on the diagram either
+way: a two-line action in one card and a one-line action in the next is what made the row
+ragged in the first place.
+**After: no tree scrolls at 1440x1000** and they render at 0.78 to 1.0 rather than 0.5, so they
+are LARGER than before. Two of the five still scroll at 1180x780, which is a canvas 369px tall
+— the voice tree has always done that there, and the floor exists for exactly this ("a legible
+diagram you move, not an illegible one you cannot read").
+
+#### `extraTree` and the three leaf actions MOVED to `workflowChrome.ts`
+⚠️ **BECAUSE THE AUDIT COULD ONLY GREP THEM.** `AgentWorkflow.tsx` imports `useProfile`, which
+reaches `profiles.ts` and its Vite-only `import.meta.glob`, so node cannot import that screen —
+which is why the extra-workflow checks matched `title: INTENT_SALES` and counted `locked: true`
+occurrences. Exactly the reason `INTENT_SALES` and friends moved on 8/27, and that file's own
+header records why it matters: "a grep passed against `if (false && CHROME_KEYS.has(path))`."
+Nothing about the values or the logic changed; the one edit is the signature, which took
+`ReturnType<typeof useProfile>[...]` to reach a type the schema exports directly. All eight of
+those checks now BUILD a tree and read it, and the lock checks run against the tree they just
+built rather than a hand-written copy.
+
+**`npm run audit:ai` went from 76 checks to 123**, and every new one was broken on purpose and seen to fire.
+Two of them did not fire on the first try, both probe faults, both already in this file's
+catalogue:
+- ⚠️ **A CHECK THAT PASSED AGAINST DEAD CODE.** The Ask AI hint check located the SMS body by
+  searching for `d?.variant === "sms"` and then read the copy inside it, so disabling the branch
+  as `if (false && d?.variant === "sms")` left the search string in place and the check passed.
+  It now asserts the guard line verbatim.
+- ⚠️ **A CHECK THAT MATCHED ITS OWN DOCUMENTATION.** `!/usePageData/.test(chat)` failed on
+  correct code because `WorkflowChatPreview`'s header says "It must NEVER call `usePageData`".
+  Comments are stripped first, which is the fix `audit:place` already carries.
+- ⚠️ And one assertion was simply wrong about the codebase: it claimed a chart's `series` length
+  was still blocked, but `/\bseries$/i` has been a length exemption since the standing AI-button
+  rules. The thing to prove is that the exemption is SCOPED, so it now asserts a BARE `steps`
+  array is still refused while `agent.steps` is not.
+
+**Verified live, end to end, reading request bodies rather than trusting the drawer:**
+- The Agent Studio table lists all five with their own Triggered By prose; the sub-nav lists them
+  under the built-in pair.
+- Each tree draws the locked chrome (`Sales Inquiry` / `Need Support`, `All Sales Inquiry Users` /
+  `Qualify`, `All Support Users` / `Support & Escalate`) with its use cases and chips below, and
+  `isLockedEdit` refuses all four boxes on every one of the five.
+- Preview Workflow and Preview Agent both send `steps` and the workflow's playbook. Scenario 1
+  answered "what else is close" by naming Randal Park, about 15 miles, with the wait-times link
+  and no wait-time number. Scenario 2 answered the doc's own line almost verbatim: "I can't
+  advise on symptoms, but I can get you in with someone who can", then asked about a primary
+  care doctor, then referred with 407-303-5910 and the context attached. Scenario 3 flagged the
+  registration for Randal Park. Scenario 4 replied "I'll connect you with our team now. It will
+  be one moment." and asked nothing further. Scenario 5 handed to scheduling for Dr. Reyes
+  without offering a time.
+- One Ask AI instruction ("open with …, add a step that confirms which facility they checked
+  into, rename Wants Care Sooner to Needs Care Tonight") produced edits to **both halves**: the
+  greeting, `steps` grown from 6 to 7 with the new step at position 3, and the path title. The
+  tree redrew, the chat's next request body carried 7 steps and the new opener, and the agent's
+  reply confirmed the facility first. The **separate** Preview Agent tab opened with the edited
+  line, proving the cross-tab read.
+- Untouched and checked: the built-in `Orlando Health - SMS` page (6 nodes, minimap still drawn,
+  Ask AI still offers "Change Orlando Health's workflow") and `Orlando Health - Voice` (12 nodes,
+  "Build Orlando Health's voice agent"). `audit:voice` 107, `audit:place`, `audit:phases` green,
+  typecheck clean. `audit:seeds` fails orlando-health on the same 14 of 34 checks as before the
+  change, verified by stashing.
+- ⚠️ Pre-existing and NOT from this work, confirmed by stashing everything and reloading: a
+  console `useProfile must be used within ProfileProvider` on the workflow pages, and repeated
+  400s from `/api/livekit-token` (the documented probe against a server with no LiveKit creds).
+- ⚠️ Also noticed: **`.wf-canvas-wide` in `app.css` is dead** — declared for "a four-branch
+  nurture tree loses a whole node off the right edge" and applied nowhere. Left alone rather
+  than removed, since the horizontal-scroll behaviour it describes may still be wanted.
 
 ### A second SMS workflow for Avi & Co: "Avi & Co - New" (9/2/2026)
 Asked for directly: *"add one more Avi & Co - SMS workflow called 'Avi & Co - New'"*. Built as a
@@ -6879,27 +8244,110 @@ COLUMN, add/remove a TILE, add/remove a chart SERIES, pie SLICE or axis POINT.
   `brief` (a paragraph, not the label) because a one-word label lets the model invent
   its own meaning, and `engine/assistant.ts` states the nurture definition too.
 
+## ⚠️⚠️ NOBODY WAS BEING TOLD WHEN FEEDBACK ARRIVED (found and fixed 9/10/2026)
+
+Reported: *"i just realised that all the feature request or feedback are only going to the local
+host and not to the live instance, so i am missing them."* The premise turned out to be half
+right, and the real cause was worse than a misrouted store.
+
+**MEASURED FIRST, on the live board.** Nothing was lost — the live instance held **24 items
+(6 feedback, 18 feature requests), 15 still open**, safe on the Render disk (`feedbackStore`
+shares `demoStore`'s `DATA_DIR`, and `/api/status` reports `storage.persistent: true`). Three of
+them were **colleagues' feedback sitting In review for over two weeks**.
+
+**Two separate things were going on, and only the second is a defect:**
+
+1. **The two stores ARE separate, and that is by design.** Localhost writes to `<repo>/.data/
+   feedback/`, the live site writes to the Render disk, and `.data` is git-ignored so neither
+   travels. The 11 items visible locally are hand-submitted test items — dated **before the
+   feature shipped**, with fabricated colleague addresses, which is how you can tell.
+2. ⚠️⚠️ **THE DEFECT: NOTHING NOTIFIED THE MAINTAINER.** The only mail this app sent was the
+   **completion** notice, to the **submitter**. So the sole signal that anything had arrived was
+   the Inbox badge on the **live** launch screen — and that badge is **per-instance**. Working on
+   localhost it read a reassuring **8 open** from test data while the live board sat at **15**.
+   A number that looks like it is working is worse than no number at all.
+
+**The fix: `newItemEmail()` in `mailer.ts`, sent from the POST path.** The maintainer is emailed
+the moment an item is submitted, with the title, the full body, who sent it and which page they
+were on.
+
+⚠️ **AWAITED, NOT FIRE-AND-FORGET.** A floating promise can be killed by the SIGTERM drain
+mid-deploy, which is exactly when a submission is most likely to be the last request through.
+`sendMail` never throws and returns its outcome, so awaiting cannot fail the submission — and
+the item is `saveFeedback`'d **before** the mail is attempted, so a mail failure can never lose
+a report. Both orderings are asserted.
+
+⚠️ **THE SUBMITTER IS EXCLUDED FROM THEIR OWN NOTIFICATION.** The maintainer files most of the
+feature requests on this board (16 of the 18 live ones), and an inbox full of your own notes is
+the same mistake as the permanent "0" badge: a notification that is usually about nothing trains
+you to stop reading it.
+
+⚠️ **`Mail.replyTo` WAS ADDED FOR THIS ONE CASE, and it is load-bearing.** This app sends FROM
+the maintainer's own address, so without an explicit Reply-To, hitting Reply on a feedback notice
+**mails yourself**. Both transports had it hardcoded (`GMAIL_SENDER || from` in the raw-message
+builder, `USER` in nodemailer); both now honour `mail.replyTo`, and the audit checks BOTH — set
+in one and not the other, Reply-To silently depends on which route sends.
+
+⚠️ **`adminEmails()` IS EXPORTED FROM `demoApi`, NOT THREADED THROUGH THE HANDLER.** `isAdmin`
+is passed IN to `handleFeedbackApi` by both callers, and following that pattern for the address
+list would mean `server.ts` AND the `vite.config.ts` twin each passing it — the exact place those
+two drift. Both already import `isAdmin` from `demoApi`, so there is no new dependency and one
+admin list.
+
+⚠️ **NON-PRODUCTION STILL DOES NOT SEND**, via the existing `isProduction()` guard — verified in
+the local log: `[mail] local: not sending to ddesai@invoca.com — "Feature request: …"`. That is
+what makes this testable at all without emailing a real colleague from a dev server.
+
+⚠️ **THE NODE-CACHE TRAP BIT AGAIN, and cost the first test.** The vite plugin **dynamically
+imports** `engine/feedbackApi.ts`, so the running dev server held the pre-fix module: the item
+saved, and **no mail line appeared in the log at all**, which reads exactly like the code not
+working. Restart the dev server after editing anything under `engine/` — this file already says
+so for `chat.ts`, `analyze.ts`, `core.ts` and `assistant.ts`.
+
+**`audit:app` gained 12 checks** covering the notice: an admin address exists at all, the subject
+carries kind + title for both kinds, Reply-To is the submitter, the full body and the board link
+are in the mail, title/body/name are HTML-escaped (submission text is user input rendered into
+HTML mail), both transports honour `replyTo`, the POST path sends it, the send is awaited, the
+submitter is excluded, and the item is saved before the mail is attempted.
+⚠️ Five were broken on purpose and each fired: making the send fire-and-forget, dropping the
+submitter exclusion, removing `replyTo` from the mail, making the Gmail transport ignore it, and
+un-escaping the title.
+
+⚠️ **THE THREE ITEMS THAT WERE WAITING** are recorded here because they are real work, not
+demo data: sales language appearing on healthcare demos (wants appointment vocabulary), a
+lead-form attribution page wanted for the UK, and a dashboard adjusted to recruiting while the
+rest of the demo stayed geared to selling freight. A fourth — a sponsored ad showing a location
+the company does not operate in — was **already fixed** by the 9/8 location work and the seven
+city keys added 9/9, and is marked Complete.
+
 ## Feedback / Support & feature requests
-- The launch-form button is **Support** (`.fb-fab`); inside, the two kinds are
+- The launch-menu row is **Support**; inside the modal, the two kinds are
   **Feedback / Support** and **Feature request**. The board splits them into TABS,
   because one is "something is broken" and the other is a backlog: mixed together you
   read past the wrong kind to find the one you came for. Each tab shows its own count
   and how many are still open.
-- **Button**: `src/components/FeedbackButton.tsx` ("Support"), beside Read.Me in the `LaunchCorner`
-  stack (`App.tsx`). Opens a modal rather than routing away: someone has a thought about
-  the tool WHILE using it, and making them leave the page is how you get no feedback.
+- **Modal**: `src/components/SupportModal.tsx` ("Support"), opened from the **launch menu**
+  (see the hamburger section below). Opens a modal rather than routing away: someone has a
+  thought about the tool WHILE using it, and making them leave the page is how you get no
+  feedback. ⚠️ It is **CONTROLLED** (`{open, onClose}`) and mounted OUTSIDE the menu panel —
+  see that section for why it cannot live inside it.
 - **Board**: `/feedback` (`src/screens/FeedbackBoard.tsx`), full-page outside the shell,
   because it is about the TOOL, not a prospect's demo.
-- **Getting there**: `InboxButton` in the corner stack, **admin only** (it renders null
-  otherwise, so a normal SE never sees it), with a badge of how many are still open. The
-  badge is the point as much as the button: a passive signal beats a board you forget.
-  It shows no badge at zero, because a permanent "0" trains you to stop reading it.
-  - Placement is **provisional** (the alternative was folding it into Support as a split
-    control). It is one line in `LaunchCorner` and its own component, so moving it is a
-    deletion plus a chevron, and nothing else in the feature knows where it lives.
+- **Getting there**: the **Inbox** row in the launch menu, **admin only** (the row is hidden
+  otherwise, because the SERVER decides — a non-admin's `?summary=1` carries no `open`, so
+  there is nothing to render), with a count of how many are still open. The count is the
+  point as much as the row: a passive signal beats a board you forget. It shows nothing at
+  zero, because a permanent "0" trains you to stop reading it.
+  - ⚠️ **THE COUNT ALSO SITS ON THE CLOSED HAMBURGER** (`.lm-dot`). Folding the Inbox pill
+    into a menu would otherwise have destroyed the one property it was built for — a badge
+    you notice without opening anything — so the dot survives even though the pill did not.
   - It fetches `GET /api/feedback?summary=1` -> counts only, 79 bytes vs 1.6KB for the full
     list on four items. Rendering a badge must not download everyone's submissions, and
     that gap grows with the backlog.
+  ✅ **RESOLVED — its placement is no longer "provisional".** This used to read: "Placement
+  is provisional (the alternative was folding it into Support as a split control). It is one
+  line in `LaunchCorner`…". It is a menu row now, which is the folding-in that note
+  anticipated.
   - The in-form link reads "See all submissions" for an admin and "See what I've sent" for
     everyone else; same summary call decides.
 - **Visibility is server-side** (`engine/feedbackApi.ts`): a submitter sees only their own
@@ -6953,17 +8401,1502 @@ COLUMN, add/remove a TILE, add/remove a chart SERIES, pie SLICE or axis POINT.
     triggered it, or the admin sees an error for an item that already saved.
   - The title is user text and goes into HTML email: it is escaped (verified).
 
-## Read.Me button + the in-app docs
-- `src/components/ReadmeButton.tsx`, mounted **once in `App.tsx`** inside `<BrowserRouter>`
-  but outside `<Routes>`. Fixed bottom-right pill, `.readme-fab` in `app.css`.
-- **It renders ONLY on the launch form** (`SHOW_ON = ["/", "/launch"]`). Everything past
-  that form is a replica of Invoca's product shown to a prospect, and a floating
-  internal-docs button on a dashboard reads as ours rather than theirs. The launch form is
-  the one screen that IS our tool. It is an ALLOW-list, not a deny-list, so a new route
-  defaults to not carrying it.
-- There are deliberately **no overlay-hide CSS rules** for it. `.aiad`, `.idr-root`,
-  `.sdr-root` and `.vp-root` all live inside the app shell, which the launch form is not
-  part of, so those selectors could never match. Don't re-add them.
+### A comment goes out with the "your request is done" email (9/16/2026)
+Asked for directly: *"allow me to add a comment when i change status of any Feedback & feature
+requests to complete before the email gets send out, and the email includes the comment."*
+
+⚠️⚠️ **MOST OF THIS ALREADY EXISTED AND NOTHING COULD REACH IT.** `PATCH /api/feedback/:id` has
+always accepted `note`, the board has always rendered it (`.fbb-note`, "Note: …"), and
+`completionEmail` has always included it in BOTH the text and the escaped HTML. What was missing
+was any way to WRITE one: the status `<select>` PATCHed `{ status }` alone, so the field was
+effectively dead code. So this is a UI change plus a check, not a new field — a second
+`completionComment` would have duplicated a path that already works end to end.
+
+⚠️⚠️ **ONE PATCH, WHICH IS THE WHOLE CORRECTNESS ARGUMENT, and it rests on ONE LINE'S POSITION.**
+The handler assigns `rec.note` from the body BEFORE the terminal-status block builds the mail, so
+the comment and the email are atomic by construction rather than by ordering luck. **Move that
+assignment below the block and the feature still looks like it works** — the comment saves, the
+board shows it, the status changes — and the email goes out without it, every time, silently.
+That is the only way this can break, so `audit:app` pins the order by comparing the two indexes
+in the source. Verified: moving it reddens.
+
+⚠️ **`note` IS OMITTED FROM EVERY OTHER STATUS CHANGE.** Sending `note: ""` on a move to "In
+progress" would erase a comment somebody had already written. The board sends `{ status }` alone
+unless the composer produced something.
+⚠️ **AN ALREADY-NOTIFIED ITEM GETS NO COMPOSER.** `notifiedAt` means that person has been told
+and no second email will be sent, so offering to write one would promise something that cannot
+happen. It saves straight through instead.
+⚠️ **THE COMPOSER'S COPY HONOURS `emailEnabled`, ALL THREE LINES OF IT** — the label, the button
+and the hint. The first version branched the label and the button and left the hint saying "Leave
+it blank to send the email without a comment", directly under a label that had just explained
+email is not configured. Two lines contradicting each other on any server without a mailer,
+caught by reading the rendered panel rather than by a type.
+⚠️ Optional, and it says so; an empty note simply omits that line, which the mail builder already
+handled. Escape closes the composer, Cancel leaves the status untouched (the `<select>` is
+controlled by item state, so it snaps back).
+⚠️ Its own `.fbb-say-*` prefix rather than the submit modal's `.fb-*` — different surface, and
+one prefix per screen is what stops a change to one restyling the other.
+
+**`npm run audit:app` gained 8 checks**; three were broken on purpose and each fired: moving the
+note assignment after the mail, sending `note: ""` on any change, and offering the composer on an
+already-notified item.
+
+**Verified end to end in the real UI**, against the production entry point with `local@dev`
+granted admin through the additive `DEMO_ADMIN_EMAILS` env var (no code edit, per the note on the
+admin list): picking Complete opened the composer without saving, the `<select>` still read "New",
+typing a comment and clicking through stored `status: Complete` with the note on the record, the
+card then rendered it, and the toast reported honestly — *"Marked complete, but the email did not
+send (local does not send email)"*. `completionEmail` was called with the note; both bodies carry
+it and a blank note omits the line. ⚠️ The test item was restored to `New` with its note and
+history cleared afterwards.
+
+## One hamburger, top right: the launch menu (9/10/2026)
+
+Asked for directly: *"the buttons on the bottom [are] good, but there are more things that i
+want to add so i dont want multiple buttons on the bottom, so lets do a Hamburger Menu with
+these on the top right."* `src/components/LaunchMenu.tsx` + `.lm-*`.
+
+Three floating pills in `.corner-stack` (bottom right) became one 42px hamburger at
+`top: 18px; right: 22px`, holding **Support**, **Inbox** (admin) and **Read.Me**.
+
+⚠️ **ADDING AN ITEM IS ONE ENTRY IN `items`, WHICH IS THE POINT OF THE COMPONENT.** Every row
+goes through `activate()` and picks its behaviour from which field it sets — `href` (new tab),
+`to` (in-app navigation), or `onSelect` (anything else) — plus optional `hint`, `badge` and
+`hidden`. **Do not add a second bespoke button beside the hamburger**; that is what this
+replaced, and the request was explicitly about not accumulating buttons.
+
+⚠️⚠️ **THE SUPPORT MODAL CANNOT LIVE INSIDE THE PANEL, and this is the trap the design is
+shaped around.** Selecting a row closes the menu, which unmounts the panel — so a modal
+rendered inside it is destroyed by the very click that asked for it. `FeedbackButton` was
+therefore split: it is now `SupportModal`, **controlled** via `{open, onClose}`, with the
+open state held by `LaunchMenu` and the modal rendered as a **SIBLING** of the panel.
+⚠️ `ReadmeButton.tsx` and `InboxButton.tsx` are **DELETED**, not left unmounted, and
+`FeedbackButton.tsx` was `git mv`'d to `SupportModal.tsx` — the name would otherwise describe
+a component that is no longer a button.
+
+⚠️ **THE INBOX COUNT SURVIVES ON THE CLOSED HAMBURGER** (`.lm-dot`, hidden while the menu is
+open where the row states it better). The old Inbox pill's whole argument was that a count in
+the corner is a passive signal you notice; folding it into a menu would have quietly destroyed
+that, so the dot is what keeps the feature's reason for existing.
+
+⚠️ **POINTERDOWN IN THE CAPTURE PHASE, NOT BUBBLE.** On bubble, clicking the hamburger while
+open closes the panel in the document handler and then immediately reopens it in the button's
+own `onClick`, so the trigger can never dismiss its own menu. This repo already documents the
+identical trap twice — the Signal sidebar flyout and the Create-Workflow channel combobox
+(where it silently ate the option click). Verified with real pointer sequences rather than
+`el.click()`, which skips the phase entirely.
+
+⚠️ **ARROW KEYS MOVE THROUGH THE ROWS.** A pointer-only menu is unreachable from the keyboard,
+the same reason the Reorder list grew arrow support. Rows are real `<button role="menuitem">`s
+so Enter/Space are native; Escape closes.
+
+**CSS: `.lm-*`, its own prefix, z-1000.** Above the launch form, below `.fb-overlay` (1400) so
+the Support modal covers it, far below `.envbadge` (4000) which must never be hidden.
+⚠️ **THE FOUR DEAD RULE SETS WERE DELETED (`.corner-stack`, `.readme-fab`, `.fb-fab`,
+`.inbox-fab`/`.inbox-n`) AND THE BLAST RADIUS WAS MEASURED**, because a component rebuild in
+this repo once deleted another screen's entire stylesheet as collateral (79 `.cd-*` rules,
+concealed by a plausible-looking diffstat). Rule counts per prefix, before → after:
+`corner 1→0`, `readme 4→0`, `inbox 5→0`, `fb 49→45` (the four `.fb-fab*` rules; all 45 modal
+rules intact), **101 other prefixes unchanged**. Two orphaned comment blocks describing the
+deleted Read.Me pill went with them.
+
+**Verified in the browser with real pointer sequences:** hamburger at 18/22 (42×42) with the
+count dot; the panel opens 288px wide inside the viewport; the toggle CLOSES it rather than
+reopening; outside-click and Escape close; arrow keys walk Support → Inbox → Support; Support
+closes the menu and opens a modal that is **still open 700ms later**; Read.Me calls
+`window.open("/readme.html", "_blank", "noopener,noreferrer")`; Inbox navigates to `/feedback`
+(where the menu still renders, since it is in `MENU_ON`). Route gating re-checked on five
+replica screens — `/dashboards/marketing`, `/call-review`, `/agent-studio`, `/reports`,
+`/signal` — all render **zero** `.lm-toggle` and zero stray fabs. At 375×812 the panel clamps
+to `calc(100vw - 28px)` with no horizontal page scroll.
+⚠️ **STALE HMR ERRORS IN THE CONSOLE LOOKED LIKE A BROKEN BUILD and were not.** After deleting
+the three components the console kept reporting `Failed to reload /src/components/
+FeedbackButton.tsx` and `InboxButton is not defined` — through a dev-server restart AND a hard
+reload, because that buffer is session-level and is not cleared per page load. The **network
+log settled it**: this load requests `SupportModal.tsx` → 200 and never requests any of the
+three deleted files. **Check the network log, not the console buffer, when an error names a
+file that no longer exists.**
+
+## Release notes, backfilled to the first commit (9/10/2026)
+
+Asked for straight after the hamburger: *"is there a way to add release notes as well from the
+very beginning"*. `/release-notes` (`src/screens/ReleaseNotes.tsx`, `.rn-*`) rendering
+`src/data/releaseNotes.ts`, reached from the launch menu's **What's new** row.
+
+**27 dated entries, 87 changes (55 new / 24 improved / 8 fixed), 2026-07-23 to 2026-09-10.**
+
+⚠️ **DATED, NOT VERSIONED, AND THE PAGE SAYS SO.** A push to `main` IS the release here, so
+there is no version to be on — the subtitle states that outright, because an SE asking "am I on
+the latest?" deserves an answer rather than a number that means nothing.
+
+⚠️⚠️ **CURATED FROM GIT HISTORY, AND GENERATING IT FROM COMMITS WAS CONSIDERED AND REJECTED.**
+All 284 commits were read and grouped by date. The commit subjects in this repo are unusually
+outcome-shaped, which is what made a *faithful* backfill possible rather than an invented one —
+but a generated changelog would still print "Record two deploy findings from shipping the
+drain", which is a true subject and useless to an SE. So anything invisible to someone USING the
+tool is deliberately absent: refactors, captures, audit scripts, documentation, and the many
+"record why X" commits. **This is not a changelog of the repository.**
+⚠️ **THE PROVENANCE IS ON SCREEN, not only in a code comment** — a footnote says the pre-September
+entries were reconstructed afterwards. A tidy list of 27 dated releases otherwise reads as
+having been written as the work happened, and the early weeks are genuinely coarser (late July
+shipped in bursts of twenty small commits a day, so those are summarised at the feature level).
+
+⚠️ **ADDING AN ENTRY IS PART OF SHIPPING A USER-VISIBLE CHANGE** — at the TOP of `RELEASES`.
+Nothing enforces the habit; a curated file rots the moment it stops being updated in the same
+commit as the work.
+
+### ⚠️⚠️ PRODUCT-WIDE ONLY — NOTHING PROSPECT-SPECIFIC (9/10/2026)
+Asked for directly, against the first draft: *"only add items that apply to the whole product,
+not anything that is prospect specific like the 'Orlando Health's ER Messaging'."* An entry has
+to be true for anyone using the tool, whichever demo they open. The **capability** belongs here
+("a demo can carry extra agent workflows"); the **instance** built on one demo does not.
+
+⚠️⚠️ **"NOT PROSPECT-SPECIFIC" IS NOT THE SAME AS "DOES NOT NAME A PROSPECT", and that gap is
+where the real work was.** A name scan found **5** offending entries. Three more had to come out
+that **named nobody and were still scoped to one demo**, which no static check can see:
+| pulled | why it was not product-wide |
+|---|---|
+| the AI Conversion by Location dashboard | gated to a single prospect, by its own design |
+| Signal AI Silver/Gold, on its 8/24 entry | shipped for ONE account that day — it legitimately earned an entry on 8/27, when it became derived for every prospect |
+| a second SMS workflow on one demo | an instance of the extra-workflow capability, which already has its own entry |
+
+Two entries were **reframed rather than deleted**, because the capability underneath them is
+real: the Dallas roster became "demos can be filed under an event of their own" (the launch-screen
+capability, which is what changed for everyone), and "extra workflows, starting with <a prospect>'s
+nurture agent" became "a demo can carry extra agent workflows beyond the built-in pair". Net
+92 → **87 changes**; the day that led with a single prospect's workflows was retitled around the
+product changes that shipped beside them.
+
+**The rule to apply when writing one: ask what an SE on a DIFFERENT demo would see.** Not whether
+a name appears in the sentence.
+
+⚠️ **`audit:app` ENFORCES THE NAME HALF AND CANNOT ENFORCE THE SCOPE HALF, and it says so.** It
+scans every title and change against the `customerName` of every profile in `src/data/generated`
+and `engine/event-seeds` plus every demo in `.data/demos` — **derived, not a hardcoded list**, so
+a prospect generated next month is covered without touching the check (80 names today). Verified
+to fire on two different names. The scope judgement is on whoever writes the entry, which is why
+it is stated in the data file's own header where the next entry gets written.
+
+⚠️⚠️ **`RELEASES[0]` IS ASSUMED TO BE THE NEWEST, and that assumption is the feature's quiet
+failure mode.** `LATEST_RELEASE` and the "New" chip are both derived from it, so an entry added
+in the wrong place leaves the chip either never firing again or firing forever, with nothing on
+screen to notice. `audit:app` asserts the list is **strictly** newest-first.
+
+### One dot, two signals, and they cannot collide
+The hamburger already carried the admin's open-feedback count. Unread release notes needed a
+signal too, and two badges on one 42px button is how a number starts meaning two things.
+- a **NUMBER** always means open feedback items, and only an admin ever has those;
+- a **PLAIN dot** means unread notes, shown only when there is no count to contradict it.
+
+So each person gets the signal that is actually theirs: the admin their inbox, everyone else the
+thing that was just shipped to them. Both hide while the menu is open, where each row states its
+own. The row additionally carries a **"New"** chip (`tag` on a `MenuItem` — a word where a count
+would mean nothing), cleared by opening the page, so it is "unread" rather than decoration.
+⚠️ **`unseen` IS RE-READ ON EVERY OPEN, not once at mount.** `/release-notes` is in `MENU_ON`, so
+the menu stays mounted while you navigate there and back — a value computed at mount would still
+say "New" after you had just read them.
+⚠️ **EVERY localStorage ACCESS IS TRY/CAUGHT and the failure answers NO.** It throws outright in
+some contexts, and this runs on the launch screen, the first thing anyone opens; an unguarded read
+would take the page down to decide whether to draw a two-word chip. A chip that cannot be
+dismissed is worse than one that never appears, because it stops meaning anything.
+
+**`npm run audit:app` is 37 checks** and covers our own chrome rather than a replica: the notes
+are non-empty, dates valid, unique and strictly newest-first, `LATEST_RELEASE` really is the
+newest, every entry has a title and changes, every change a valid kind and text, `unseenRelease()`
+survives having no localStorage, and — pinning the actual ask — **the oldest entry equals the
+repo's first commit**, so trimming the list to "the recent stuff" cannot silently rewrite what the
+page claims to be (skipped where git is unavailable rather than failing for the wrong reason).
+Plus the menu: all four rows present, both routes registered AND in `MENU_ON`, the gate still an
+allow-list, `SupportModal` controlled and **structurally outside the panel**, capture-phase
+pointerdown, Escape and arrows, no CSS left for the three replaced pills, the z-order
+(menu 1000 < support overlay 1400 < env badge 4000) read from the stylesheet, and the replaced
+components gone from disk rather than merely unmounted.
+⚠️ Five were broken on purpose and each fired: swapping two entries out of order (2 red), deleting
+the first-commit entry, putting the outside-click back on the bubble phase, removing the
+release-notes row, and dropping `/release-notes` from `MENU_ON`.
+
+**Verified in the browser:** the row shows "New" on a fresh profile, the page renders 27 releases
+and 87 changes with the kind chips at a uniform 70px so the sentences align, the chip is gone
+after reading, and the back link returns to `/launch`. The non-admin branch was exercised by
+suppressing the summary fetch: no numeric dot, a 10×10 plain dot, and the Inbox row hidden
+(three rows instead of four). No horizontal scroll; at 640px the chips stack above their text
+rather than leaving ~150px for the sentence.
+
+## AI SMS Conversation Intelligence's Marketing Data card now carries real attribution (9/11/2026)
+Asked for directly, against the selected `.sci-info-card`: *"add all the marketing data for this
+SMS Info, like all the data that you have added to the salesforce lead."* Before this the card
+had two generic fields (Destination Time Zone, SMS Session Status); it now carries the same
+eleven attribution fields the Salesforce Lead record's "Invoca Captured Attribution" section
+shows — same labels, same order, same derivation.
+
+⚠️⚠️ **DERIVED, REUSING `salesforceLeadDetail.ts` RATHER THAN A SECOND, INDEPENDENT COPY OF THE
+SAME LOGIC.** `smsInfoAttribution(profile, callerName)` (new, in that file) exports
+`lineOfBusiness` and reuses `categoryRows` / `strongLexical` / `categoryFor` / `offerFromCall` —
+the exact functions the Lead page's own attribution runs through — so the two screens are
+structurally incapable of computing two different answers for the same inputs. This is the same
+"one digitalInsights row taken whole" principle the Lead page's own header already states,
+applied a second time rather than re-derived.
+
+⚠️⚠️ **WHEN THE CALLER IS SOMEONE `salesforceLeads.ts` ALREADY NAMES, THIS IS LITERALLY THAT
+PERSON'S OWN LEAD RECORD, NOT A LOOK-ALIKE — and getting this right took two passes.**
+`salesforceLeadDetail(profile, leadSlug(first, last))` is called directly for a caller who
+matches a real Lead, so the two screens share their numbers by construction rather than by two
+derivations happening to agree.
+- **First pass matched only `smsScreenpop.callerName`, and it silently never fired.**
+  Verified on Shady Blinds: the seeded ACTIVE SMS conversation's caller is "Jessica Harper" —
+  but `smsScreenpop.callerName` on that profile is **"Marcus Bell"**; Jessica Harper is
+  `voiceScreenpop.callerName`. `salesforceLeads.ts`'s own header already documents that a
+  profile's named callers are scattered across FOUR sources (voice screen-pop, SMS screen-pop,
+  voice CI, SMS CI) — checking only one of them missed exactly the case that mattered on the
+  very first profile tested. Fixed to check both screen-pops' caller names.
+- **Second, unrelated bug in the same pass: matched against `info.displayName`, which is NOT
+  the caller's full name.** The engine invents `displayName` and `firstName`/`lastName`
+  independently ("J Harper" vs. "Jessica" + "Harper"), so comparing `displayName` against
+  `smsScreenpop.callerName` ("Jessica Harper") could never equal it even once the screen-pop
+  check was widened. Fixed to compare `` `${info.firstName} ${info.lastName}` `` instead.
+  ⚠️ **Neither bug was caught by a type or a build** — both were found by reading the rendered
+  page against that same caller's own Lead record and noticing the numbers disagreed, which is
+  the whole failure mode this feature exists to prevent. Verified after both fixes: Shady
+  Blinds' Jessica Harper reads Product of Interest "motorized shades", Marketing Campaign "The
+  Privacy Project", Marketing Search Terms "traditional colonial window shutters" on BOTH
+  screens, character for character.
+
+⚠️ **EVERY OTHER CALLER (an inactive shell, or a name neither screen-pop mentions) falls back
+to the SAME functions with a stable hash of that caller's own name** — still one coherent
+`digitalInsights` row, still the real category-matching order, still the recovered-or-blank
+promotion — just not claiming to be a specific person's CRM record. Verified on Orlando Health
+with a non-matching caller ("Jennifer Martinez"): the card renders a fully internally-coherent
+row (Line of Business "Healthcare", Product Category "Cancer Institute" agreeing with Product
+Name "Cancer Treatment", Marketing Source "Social Media" agreeing with Medium "Facebook" and a
+calling-page URL whose own `utm_source`/`utm_medium` match both), with no crash and no blank
+card.
+⚠️ **A KNOWN, ACCEPTED LIMIT: the fallback's product is not necessarily what THIS transcript is
+about.** Jennifer Martinez's transcript is about scheduling a mammogram; her card's Product of
+Interest reads "cancer treatment" (a stable pick off Orlando Health's own `smsScreenpop.products`
+list, not the transcript). Fixing this would need parsing the transcript itself for a topic,
+which no other field on this screen does either — the existing signals/key points are already
+independent of a structured "topic" field. Flagged rather than papered over with a heuristic.
+
+`products` and `productList` were exported from `salesforceLeads.ts` (previously private) so
+`smsInfoAttribution` can pick a product for a caller with no Lead of their own, using the exact
+same comma-split every real lead's product already goes through.
+
+No new CSS: `.sci-info-card` / `.sci-info-grid` are plain auto-sized flex/grid with no fixed
+height, so a card growing from 2 fields to 13 needed no layout change — verified by screenshot.
+
+Verified: `npm run audit:leaddetail` (15 profiles) and `npm run audit:leads` (15 profiles) both
+green — this reuses their functions but touches none of their own logic — and `tsc -b` clean.
+
+## The dashboard header's own AI sparkle removed — one was already enough (9/11/2026)
+Asked for directly, against the selected `.dash-ai-header` sparkle in a dashboard's
+`title-actions` row: "Remove this AI icon as there is already one at the top of page."
+
+TopBar's own hover-revealed sparkle (`.tb-ai`) already opens the same Ask AI drawer on every
+page, dashboards included, so the header's copy was a second entry point to the identical
+feature, not a second capability. Removed from `DashHeaderActions.tsx` (the `openDrawer`
+destructure went with it, since nothing else used it) and its now-dead `.dash-ai-header` CSS
+rule from `app.css`. The **per-tile** sparkles (`DashTileAi`/`.dash-tile-actions`) are
+unrelated — they scope an edit to one tile rather than the whole page — and are untouched.
+
+Verified: `npm run typecheck` clean, `npm run audit:ai` green (nothing asserted the removed
+icon's presence), and live on Orlando Health's Marketing Performance dashboard — the header
+sparkle is gone, TopBar's own "Ask AI about this page" button still opens the drawer.
+
+## Every "Ask AI" surface now runs the voice workflow's director treatment (9/11/2026)
+Asked for directly, in the same message as the icon removal above: "for all the Ask AI,
+become a lot more robust, basically all the Ask AI on the platform should be just as robust
+as however you set up the Ask AI for the Voice Agent."
+
+⚠️⚠️ **INVESTIGATED FIRST, AND THE FINDING SHAPED THE WHOLE CHANGE: BOTH TIERS ALREADY LIVED
+IN ONE FUNCTION.** `engine/assistant.ts`'s `askAssistant()` already served every "Ask AI"
+surface platform-wide from one entry point, gated by a single boolean —
+`isVoiceAgentPage(dataContext) = /"agent"\s*:/.test(dataContext)` — that chose between a
+fast, cheap Haiku path (every other page) and a strong, streamed Opus path with adaptive
+thinking and `effort:"high"` (the voice workflow only). The frontend (`AiAssistantDrawer.tsx`)
+and both server endpoint twins (`server.ts`, `vite.config.ts`) already branched generically
+on a `stream` flag, so the progress-bar UI already existed and needed no new component. So
+this was never a rewrite — it was widening which requests take the strong path, and rewriting
+the prompt language that had been written specifically to restrain a WEAK model.
+
+**What changed, concretely:**
+1. **`isVoiceAgentPage()` no longer gates the model, effort or transport** — only the removed
+   `FAST_MODEL` (Haiku) path did that, and it is deleted. `DIRECTOR_MODEL` is renamed `MODEL`
+   (it is no longer one page's special case) and every request now runs Opus 5 with
+   `thinking: {type:"adaptive", display:"summarized"}` and `output_config.effort:"high"`,
+   streamed via `client.messages.stream()`.
+2. **`isVoiceAgentPage()` still exists**, narrowed to what it always should have meant: whether
+   `buildSystem()` splices in the voice-specific brief (`agent.greeting`, `informSteps`,
+   `serviceZips`, the voice list, …). Those fields genuinely do not exist on a page whose data
+   carries no `agent` key, and naming them anyway is the documented failure mode ("naming a
+   field that is not in the model's data is how it invents a path and writes the edit
+   somewhere else" — the exact bug recorded at the SMS greeting).
+3. **The generic "HARD RULES" section was rewritten out of its hedged, refusal-heavy form**,
+   for the same reason the director brief itself was rewritten on 9/3: `editGuard` already
+   makes CSS/layout/chart-type edits structurally impossible (no data value reaches a
+   `className` or `style`, chart type is chosen in JSX, `editGuard` drops a type flip or
+   structural change regardless of what the model returns), so repeating "YOU MAY NEVER X,
+   DECLINE via answer" for something the code already prevents reads as a weak model being
+   managed — and it had previously self-contradicted the capability line beside it (asked to
+   add a column, the model read the old prohibition and refused). The rules now say what IS
+   wired up, once, and trust the guard for the rest.
+4. **Both frontend drawers (`AiAssistantDrawer.tsx`, `InsightsAskDrawer.tsx`) always request
+   the stream now** — `wantsStream` was a test of the page's data shape matching the old
+   Haiku/Opus split; with one path for every page, that test would have silently left some
+   pages showing no progress bar for a 15-25s wait. `InsightsAskDrawer` gained the same SSE
+   reader `AiAssistantDrawer` already had (it had none before, only a static "Thinking…").
+
+⚠️⚠️ **THE COST/LATENCY TRADEOFF IS REAL AND STATED, NOT HIDDEN.** A one-line dashboard edit
+that used to answer in ~2-3s on Haiku now takes the same 15-25s the voice page always has,
+and costs Opus-tier tokens instead of Haiku's. Chosen deliberately over keeping the split,
+because the split's failure mode was invisible: a Haiku answer to a multi-part instruction
+looks like a normal, if partial, success, and only a careful SE comparing the request against
+what actually changed ever notices the gap. Every request streams with a real progress bar
+precisely so the new wait is never a silent spinner.
+
+⚠️ **`scripts/audit-ai-rules.ts`'s "THE VOICE AGENT DIRECTOR" section was rewritten, not
+just relaxed** — its dozen checks assumed the two-tier split and asserted the fast path
+existed, which is now backwards. The rewritten section asserts the opposite invariant: no
+`FAST_MODEL`/`if (!director)` path exists at all, `isVoiceAgentPage` is still called (scoping
+prompt content only), adaptive thinking and `effort:"high"` are unconditional, both drawers
+always request the stream, and a dropped stream still fails loudly rather than reading as a
+silent success. Two of the new checks were wrong on the first pass and are the record of it:
+the `effort` check matched this very section's own header prose (`` `effort:"high"` `` with no
+space, versus the real code's `effort: "high"` with one) until anchored to require the space,
+and the `InsightsAskDrawer` stream check matched an unrelated `dec.decode(value, {stream:
+true})` TextDecoder option until anchored to the request body's `canCreateTiles: true,\nstream:
+true,` pair. Both were caught by deliberately sabotaging the real code and confirming the
+check still passed — a check that cannot fail is worse than none, the same lesson this file
+has recorded from several other probes.
+
+Verified: `npm run typecheck` clean, `npx tsx scripts/audit-ai-rules.ts` green with every check
+in the rewritten section confirmed to FIRE by sabotaging the corresponding code (reintroducing
+`FAST_MODEL`, dropping `effort:"high"`, reverting either drawer's stream flag) and reverting.
+`npm run audit` unaffected — its only failures are the pre-existing generated-profile-data
+issues this file already tracks (signal tier pairs, conversion-story ordering on a handful of
+demos), unchanged by this work. Live in the browser: asking the Marketing Performance
+dashboard's Ask AI (Orlando Health) to "Bump Call Count to 9500 and Total Revenue to
+$2,000,000" showed "Sending to Claude Opus" and a live progress bar — the voice page's exact
+UI — then landed both edits, and the model additionally flagged (in "answer") that the
+breakdown tables still summed to the old total and offered to reconcile them, which is the
+kind of coordinated, multi-part reasoning a Haiku answer would not have caught.
+
+## Local Services Ads on the Google Search screen (9/12/2026)
+Asked for first with a screenshot — a real LSA unit ("Sponsored Plumbers | Duluth", two rows,
+each with a rating/review count/years-in-business/status line and Get quote / Book online / Get
+phone number actions), "build 2 rows of LSA before the first marketing campaign similar to this
+page" — then rebuilt against a SingleFile **capture** of the same unit (see the next block).
+`GoogleSearch.tsx` (`.gs-lsa-*` in `standalone.css`), inserted between the location chip and the
+first `Sponsored Results` heading (the text-ad block). It is Google's OTHER paid unit: the one
+that runs above the text ads for local trade categories.
+
+⚠️⚠️ **THE PROSPECT LEADS IT, AND THE SECOND ROW IS A RIVAL THE SCREEN ALREADY BUILT** — not
+a third set of invented names. `rivals[0]` and its rating (`d.places[1].rating`) already exist
+for the local pack; the LSA rows reuse them rather than inventing a disagreeing figure.
+
+⚠️⚠️ **THE HEADER NOUN IS A TRADE-PROFESSIONAL PLURAL, NOT `d.seg`.** `d.seg` is a
+product/category noun built for the ad copy elsewhere on this screen ("Window Treatments",
+"Vision Care") and reads wrong as "Sponsored Window Treatmentss | Duluth" — wrong word class
+and wrong pluralisation. `providerNoun()` is a keyword table over `profile.industry` (the same
+shape as `vocabFor` in `insightsCatalog.ts`), with a generic `${seg} Providers` fallback so a
+vertical not in the table still reads as a real category. Verified across three very different
+verticals: Shady Blinds → "Window Treatment Companies", Orlando Health → "Doctors", AutoNation
+→ "Auto Repair Shops" — all correct, all in Santa Barbara / Orlando / Miami respectively.
+
+### ⚠️⚠️ REBUILT FROM A REAL CAPTURE THE SAME DAY, AND THE SCREENSHOT VERSION WAS WRONG SIX WAYS
+The first pass was authored from the screenshot, reusing PlaceRow's classes on the reasoning
+that it was "structurally the same kind of row". A SingleFile capture of the real unit arrived
+an hour later (`reference/google-search/lsa-v1.html`) — "make sure it matches perfectly, CSS,
+the Icons, alignment" — and measuring it the way the rest of this screen was measured found six
+things a picture cannot settle. **Every one is now a measured value**, listed in full at the
+`.gs-lsa-*` rules:
+
+| | screenshot pass | measured |
+|---|---|---|
+| heading | 16px, borrowed `.gs-spons-head` **with its underline** | **20px** Google Sans, **no underline** |
+| name | 18px Google Sans (`.gs-place-name`) | **20px/24px Roboto** |
+| secondary text | `--gs-2` `#9e9e9e` | **`#bfbfbf`** — the unit's own grey, neither `--gs-2` nor `--gs-mut` |
+| status line | whole line green | **only the leading phrase** is `#6dd58c`; the `·` and badge are `#bfbfbf` |
+| thumbnail | 64x64 | **92x92**, radius 8 |
+| "Show more" | a standalone pill | a **372x40 pill centred ON a full-width 1px rule** |
+
+⚠️⚠️ **THE STATUS-LINE COLOUR IS THE ONE WORTH REMEMBERING.** A screenshot reads
+"Open 24 hours · Emergency heating services" as one green line, and it is not: the capture's
+DOM nests the leading phrase in its own span at `#6dd58c` while the separator and badge stay
+`#bfbfbf` — exactly the split `.gs-place-hours b` already does one section down. Colour that a
+human eye reads off a JPEG is a guess; the computed style is not.
+
+⚠️ **AND IT NO LONGER REUSES PlaceRow's CLASSES.** Once measured, `.gs-place-name` (18px Google
+Sans) and `.gs-place-stars` were simply different values, so sharing them would have meant
+either wrong type here or editing classes another section is signed off on — the "a change for
+one screen stays on that screen" rule. The LSA unit has its own `.gs-lsa-*` set throughout.
+
+⚠️ **THE ICONS ARE GOOGLE'S OWN, EXTRACTED VERBATIM** (`LSA_P` in `GoogleSearch.tsx`), per the
+standing use-the-real-icons rule: filled 24x24 Material paths for the quote bubble, calendar,
+phone, the `more_vert` kebab and the `expand_more` chevron. ⚠️ **They are deliberately NOT the
+thin stroke glyphs `P` holds** — that set exists because the filled icons read too heavy for
+this page's CHROME, whereas the LSA unit's icons genuinely ARE the filled set at
+`fill: #a8c7fa`. Rendered with `<Icon fill />`, which the component already supported.
+
+⚠️ **THE STARS ARE A PARTIAL-FILL GRADIENT, because the real ones are.** The capture draws a
+68x11 bar with `linear-gradient(to right, #fdd663 …, #80868b …)`, which is how a 4.7 shows a
+partially filled last star. Reproduced with this page's own glyphs plus `background-clip: text`
+driven by a `--fill` custom property computed from the rating — with the colour set on the
+element first and only made transparent inside an `@supports` guard, or a browser without
+`background-clip: text` would render five invisible stars.
+
+⚠️ **THE ACTION SET VARIES PER ROW ON PURPOSE.** The capture's first row carries two buttons and
+its second three; that unevenness is part of how the real unit reads. The prospect gets the full
+three (Get quote is the one this demo is about) and the rival two.
+
+### The thumbnails are REAL photos, from two different sources on purpose (9/12/2026)
+This shipped with hashed-colour initial squares and the reasoning that inventing a photo for a
+fictional business was the "wrong kind of convincing". Overruled, directly: *"I want the
+thumbnail pictures to be real pictures, so ofcourse for the prospect it should be a real pic,
+but for the made up ad in the 2nd row, you can choose whatever relevant real pic."*
+
+⚠️⚠️ **THE PROSPECT'S IS THE PROSPECT'S OWN, ON THE CHAIN `ChatGptAd` ALREADY USES** —
+`/api/place` (a real Google Places listing photo of the actual business), then `/api/og-image`,
+then a stand-in. Both endpoints already existed on BOTH server twins, so this needed no new
+infrastructure, and `engine/places.ts` already REJECTS a listing whose name does not match the
+prospect — which is exactly what stops the tile showing some other company's storefront.
+**Measured across the library: 12 of 15 prospects resolve a genuine Places photo**, complete
+with that business's real rating and review count.
+
+⚠️⚠️ **THE RIVAL'S MUST NOT COME FROM PLACES, and that is the whole reason it is a stock
+photo.** Querying Places for an INVENTED name ("Miami Automotive Retail") would either find
+nothing or, far worse, attach a real local business's photograph to a business this demo made
+up — the misattribution `nameMatches` exists to prevent. So row 2 draws from a curated
+per-vertical table (`LSA_PHOTO`): nobody's specific storefront, just the trade.
+
+⚠️ **FREE-LICENCE UNSPLASH ONLY.** Every id was harvested from Unsplash's own search and
+filtered to `images.unsplash.com/photo-…`; Unsplash+ results (`plus.unsplash.com/premium_photo-…`)
+are excluded because that tier carries a different licence. All 25 were verified to load at the
+exact 184x184 params used — a 404 would silently fall back and read as the feature not working.
+
+⚠️ **THE PROSPECT'S FALLBACK IS A DIFFERENT GENERIC FROM THE RIVAL'S, and that collision
+actually happened.** With one generic photo, a prospect with no real listing (Shady Blinds)
+drew the SAME image as the rival directly beneath it — two identical photos stacked, which is
+worse than the letter tile it replaced. `_prospect` (service vans) is separate from `_default`
+(a storefront), so the two rows can never collide. The three prospects that take this path are
+Shady Blinds, Surfside Healthcare and Marriott — two of them FICTIONAL businesses, i.e. exactly
+the "made up" case a stock photo was authorised for.
+
+⚠️ **THE LETTER TILE SURVIVES AS THE LAST RESORT ONLY** — no photo at all, or an image that
+fails to load — because a broken-image glyph mid-demo is worse than a deliberate-looking tile.
+
+#### ⚠️⚠️ "Can you grab the image the prospect actually uses?" — measured, and the answer is no
+Asked directly, and worth recording because the obvious answer is wrong. `og:image` IS the
+picture the company chose for itself (`engine/ogImage.ts` says exactly that), and it is already
+the fallback — so "prefer it over Places" looks like a free win. **Rendering both columns at
+92x92 side by side killed it:**
+
+| | Places | their own og:image |
+|---|---|---|
+| coverage | **12 of 15** | 8 of 15 — the enterprise sites (AutoNation, Orlando Health, Mattress Firm, Marriott, Denver Health, Key-Whitman) 403 a server-side fetch |
+| Roto-Rooter | van + technician | its **LOGO** |
+| Goosehead | storefront signage | a **logo mark** |
+| National Van Lines | truck + driver | its **LOGO** |
+| Continuing Life | community exterior | a **"Great Place To Work" AWARD BADGE** |
+| Comfort Keepers | office exterior | banner cropping to "…e Care …vates …man Spirit" |
+| Aptive | building | banner cropping to "ptive" |
+
+**Places wins for all seven prospects that carry both.** The reason is structural: `og:image` is
+authored for a WIDE link-preview card, so square-cropping one slices the wordmark in half. And a
+`logo|badge` filename filter cannot rescue the idea — the two WORST og images are named
+`og-img.jpg` and `image.jpg`.
+
+⚠️ **SO THE PRECEDENCE DID NOT CHANGE; ONLY THE FALLBACK WAS GUARDED.** `looksLikeLogo()` now
+skips an og:image that names itself a logo/badge/icon/award and takes the stock trade photo
+instead. **That path is reachable, not hypothetical: a server with no Places key is a supported
+state, and in it EVERY prospect falls through to og:image** — four of eight would show a cropped
+logo. Verified by stubbing `/api/place` empty in the browser: Roto-Rooter then renders the
+plumber stock photo rather than its cropped logo, and with Places live it is back to its own van
+photo, unchanged.
+⚠️ **A STATED LIMIT:** Goosehead's og:image is a content-hash filename (`52e9612c….png`), so no
+filename rule can catch it. It is a logo, and if Places ever fails for that prospect it will be
+cropped. Caught only by a real image inspection, which is not worth building for one case.
+
+⚠️ **AND A GRAMMAR BUG THE PHOTOS EXPOSED: "Sponsored Hotels Providers | Santa Barbara".**
+`providerNoun`'s fallback appended "Providers" to `industrySeg`, which is ALREADY PLURAL about
+half the time ("Hotels", "Health Systems", "Care Services"). An already-plural seg is the answer
+as it stands; only a singular one ("Vision Care") takes the suffix.
+
+⚠️ **THE GREEN STATUS LINE NAMES NO REAL ACCREDITATION BODY.** The capture's own rows read
+"BBB A+ rated" and "Generac authorized dealer" — a real certifying body and a real manufacturer
+program, on REAL businesses. Inventing either for a fictional rival would be fabricating a
+credential, so `LSA_STATUS` uses generic, genuinely Google-Guarantee-shaped badges instead:
+"Licensed & insured", "Background checked", "Locally owned & operated", "Same-day service
+available".
+
+⚠️ **REVIEW COUNTS, YEARS IN BUSINESS AND THE STATUS LINE ARE ALL HASHED PER BUSINESS NAME**,
+so an SE revisiting sees the same numbers rather than ones that move under them — the same
+determinism rule every other invented figure on this screen already follows (the gclid, the
+tracking phone number, the competitor names).
+
+**Verified: a 66-property diff against the capture came back EMPTY** — unit box and transparency,
+header height and the absence of an underline, heading/name/line/label/pill fonts and colours,
+the CTA's radius, border, padding and 12px icon inset, row height and padding, the 92x92/8px
+thumb and its 16px gap, the three 20px lines, the green/grey status split, the actions' 24px gap
+and flex-end alignment, the 44x44 circles at y=17, the label line-breaks ("Get quote" one line,
+the other two wrapping), the between-rows divider and its absence after the last row, and the
+pill's 372x40/20px/`#2c2e35` box centred at x=140 over a `top: 20px` 1px `#444746` rule.
+⚠️ **Two of the three apparent mismatches in that run were PROBE faults, not code** — reading
+the actions' wrapper box instead of the circle inside it, and dot-accessing `top` on a
+`getComputedStyle(el, '::before')` object (which returns 0; `getPropertyValue('top')` returns
+the real `20px`). Ninth and tenth probe-not-code faults recorded in this file.
+
+Also verified across three very different verticals (Shady Blinds, Orlando Health, AutoNation):
+the header noun, city and both rows render correctly, the rest of the page (Sponsored Results,
+Places/local pack, organic results, footer) is unchanged, the block fits the 652px column with
+no horizontal overflow, and `npm run typecheck` is clean.
+⚠️ The capture is kept at `reference/google-search/lsa-v1.html` so these values can be
+re-checked; the transient stripped copy went in `public/__m/`, which is git-ignored precisely
+for that ("extracted capture frames, measured then deleted") and was deleted after measuring.
+
+## "Get quote" opens the Send request dialog (9/12/2026)
+Asked for directly: *"Build what happens when someone clicks the 'Get Quote' button."* Measured
+off a SECOND capture taken with the dialog open (`reference/google-search/lsa-quote-v1.html`).
+`QuoteDialog` in `GoogleSearch.tsx`, `.gs-q-*` in `standalone.css`.
+
+⚠️⚠️ **THE DIALOG LIVES IN A SANDBOXED IFRAME, SO NONE OF IT IS MEASURABLE FROM THE PARENT.**
+Its `sandbox` omits `allow-same-origin`, so `contentDocument` is null — the same wall
+CLAUDE.md already records for the ThoughtSpot frame, and the fix is the same: SingleFile
+stores the frame in a **`srcdoc` attribute** (1,002,710 chars here), so extract that to its
+own file and serve it, at which point every computed style is readable. **Stripping the
+sandbox to get in is both the wrong instinct and blocked.**
+⚠️ **AND MEASURE THE FRAME AT THE SIZE IT ACTUALLY GETS — 700x748.** Its layout is
+responsive: read at the browser's own width it lays out 800 wide and reports a column width
+the dialog never renders. The iframe's size in the parent is the only correct viewport.
+
+⚠️ **THE DIALOG'S SURFACE IS `#1f1f1f`, NOT THE PAGE'S `#22242a`.** That is the frame's own
+body colour, and the container behind it (`.qk7LXc`, which IS #22242a) is completely covered.
+Reading the outer container would have painted the dialog the wrong grey.
+
+Everything else measured and reproduced: scrim `rgba(0,0,0,.6)`; dialog 700 wide, centred both
+axes, radius 8, shadow `0 5px 26px / 0 20px 28px rgba(0,0,0,.5)`; header 64 with a 48x48 back
+button at x=20 and the title at x=88 in `400 18/24 Google Sans #dadce0`; body inset 24 (652
+content); the business block's 52x65 radius-8 photo with a 12px gap and the text column at
+x=88; MDC notched outline `1px #bdc1c6` at radius 4; message box 636x128; helper/counter
+`400 12/14 Roboto #9aa0a6`; name and phone at **313** (half the column); radios 40x40 with a
+20x20 ring `2px #8ab4f8` and a 10x10 dot; legal `400 12/16 #bfbfbf` with `#99c3ff` links;
+footer 52 with two 321x36 buttons 10px apart — "No thanks" outlined `1px #3c4043` ink `#8ab4f8`,
+"Send" filled `#8ab4f8` on `#1f1f1f`, both radius 36.
+**A 52-property diff against the capture came back empty.**
+
+⚠️ **THE CAPTURE'S SELECT IS IN ITS FOCUSED STATE** (blue label and outline) because it held
+focus when the page was saved — so the resting grey is what is built, and blue is the
+`:focus-within` rule. A freshly opened dialog focuses the MESSAGE field, which is the one
+thing the dialog exists to collect.
+
+⚠️⚠️ **THE SERVICE LIST IS THE PROSPECT'S OWN PRODUCT CATEGORIES.** The capture's dropdown was
+closed when saved, so its options are NOT measured — but "the service you need" is exactly what
+`Conversions by Product Category` already holds, so this re-skins for free and can never offer
+a service the business does not sell. Verified: Roto-Rooter offers Plumbing / Drains / Water
+Damage / Commercial, Orlando Health offers Cancer Institute / Heart & Vascular Institute /
+Orthopedic Institute / Women's Institute.
+
+⚠️⚠️ **WHAT HAPPENS AFTER "Send" IS NOT IN THE CAPTURE, SO THE CONFIRMATION IS AUTHORED AND
+SAYS SO IN THE CODE.** It is deliberately assembled from the dialog's OWN measured parts (the
+same header, the same business block, the same button) rather than inventing new Google chrome
+— the rule the CI tier report already paid for ("anything added back has to exist on the real
+report first"). Replace it if a capture of the real one turns up.
+
+⚠️ **THE OTHER TWO ACTIONS STAY INERT.** "Book online" and "Get phone number" have no captured
+destination, so they remain spans rather than buttons — a control that looks clickable and goes
+nowhere is the same lie the inert place actions on this page already avoid. Only "Get quote"
+became a `<button>`, and it needed the browser's button styling reset or it sits a pixel out in
+a system font (the reset `.gs-loc-pill` already needed).
+
+Verified with real clicks: the dialog opens re-skinned to the prospect (its real Places photo,
+rating and review count), Send is disabled until message + name + contact are filled, the
+counters track (94/600, 14/50), sending shows the confirmation echoing the real contact method
+and number, and Done / Escape / a scrim click all close it and it reopens empty. The unit
+underneath is untouched at 652x341.
+
+## Sending the quote request creates a Salesforce lead AND an SMS workflow (9/12/2026)
+Asked for directly: *"When send is click, it should create a lead in salesforce, and also
+create a SMS Workflow based on what is shared in the form… Duplicate the SMS workflow, keep
+everything the same, the only difference will be the Preview Agent and Preview Workflow. the
+opening message and follow up messages are customized based on what was typed in the form
+fields: Your message, Service and Name."*
+
+⚠️⚠️ **ONE RECORD, TWO READERS.** The submission goes into `QuoteCaptureContext` — the third
+sibling of the SMS and Voice capture stores, same localStorage shape, same 7-day TTL, same
+`storage` listener — and the Leads tab and Agent Studio each DERIVE their view from it
+(`liveQuoteLead` in `salesforceLiveLead.ts`, `quoteWorkflow` in `quoteWorkflow.ts`). Writing a
+lead and a workflow separately at submit time would be two records of one event, free to drift.
+⚠️ **AND THE SEARCH SCREEN IS USUALLY A DIFFERENT TAB** (it opens from the top bar's Network
+chip), which is why the store writes synchronously and listens for `storage` — otherwise
+neither the lead nor the workflow would appear until somebody refreshed.
+
+### The lead
+Built beside `liveBookedLead` and spliced with the **same replace-then-move rule**, not a
+second one: an LSA requester can easily be a name already on the list, and a blind `unshift` is
+what put one person on two rows before. Lead Source is **"Web"**, not "Inbound Call" — they
+typed into an ad, they did not ring — and the Description carries what they wrote plus the
+service and how they asked to be contacted. No address: the form never asked for one, and
+inventing a street for somebody who only gave a phone number would fabricate the one field a
+rep would act on.
+⚠️ **`salesforceLeadDetail` HAD TO BE THREADED TOO.** It resolves a slug against
+`salesforceLeads`, so called without the quotes the record page opens "Lead not found" on the
+row the SE just created — the exact failure that file already records for the Calendar chip.
+
+### The workflow
+⚠️⚠️ **THE TREE IS DELIBERATELY THE STANDARD ONE.** `branches: []` makes `extraTree` render
+exactly the four locked chrome boxes and the two locked leaves — i.e. the shape the built-in
+SMS workflow draws. The instruction was "keep everything the same"; inventing use cases is the
+one thing that would have made it NOT a duplicate. Everything that differs is conversation.
+Each form field does a different job and none is dropped: **Name** — the agent greets a person;
+**Message** — quoted back in the opener (that is what makes it read as a reply rather than a
+broadcast) and handed to the model as the job to scope; **Service** — optional, so every use of
+it is guarded, and it picks the qualifying questions.
+
+⚠️⚠️ **`openingMessageWins` EXISTS BECAUSE THE FEATURE WAS OTHERWISE A SILENT NO-OP ON THREE
+PROSPECTS.** `buildSmsBrain` ranks a stored `smsPlaybook.greeting` ABOVE a workflow's own
+`openingMessage` — correct for the 9/3 bug, where a line authored months ago was beating an
+SE's edit. A workflow generated from a form inverts that: its opener quotes words typed seconds
+ago. **Measured: 3 of 15 profiles ship a stored greeting (Aptive, Denver Health, Marriott)**,
+and on those the whole beat would have opened with the generic line. Flagged on the workflow
+rather than re-ordering the precedence for everyone, so every authored workflow is untouched,
+and an edit made ON the generated workflow still wins (`wfAgent.greeting` is checked first) so
+Ask AI and the Details tab keep working.
+⚠️ Safe as an `.optional()` schema field because `ExtraWorkflow` is **not** part of any
+generation schema — `sanitize()` would otherwise force it onto the model, the trap that made
+the engine invent `InteractionRow.cells`. Verified no engine phase writes `extraWorkflows`.
+
+⚠️ **ONE DEFINITION, SIX READERS — `useExtraWorkflows`.** The Agent Studio table, the sub-nav,
+the workflow page, Preview Agent, Preview Workflow and the preview page's title each resolved
+`profile.reports.extraWorkflows` separately; a generated workflow listing in one and resolving
+in none is a dead row mid-demo. All six now call one hook. ⚠️ The hook lives in
+`quoteWorkflow.ts` and imports the context, never the reverse — the other direction is a
+runtime cycle of exactly the kind `leadSlug` was moved to kill.
+
+**Verified end to end on Aptive** (chosen *because* it ships its own greeting): submitting
+"carpenter ants along the back deck…" with the service "Recurring Residential Pest Plans"
+produced — Dana Whitfield as the top lead with the form's own phone, the list still 10, the
+record page resolving with Lead Source "Web" and the message in Description; and
+"Aptive - SMS - Quote Request (Dana)" in the Agent Studio table, the sub-nav and its own
+workflow page with the standard locked chrome. **Reading the `/api/chat` request body** (the
+reliable test this file insists on) shows the customized opener, all 7 form-derived steps and a
+system prompt quoting their words; the agent then took the address without re-asking the
+problem and offered two windows. The stored Aptive greeting is "Hi, this is Aptive's AI
+agent…" — proving the flag is what makes the opener reach the phone. A prospect with no
+submission is unchanged: Orlando Health still lists exactly its own seven workflows.
+`audit:ai`, `audit:leads`, `audit:leaddetail`, `audit:calllog`, `audit:clrecord` and
+`audit:place` all green, typecheck clean.
+
+## Replicate renders in a REAL browser, off-box, because uptime beats accuracy (9/13/2026)
+Reported after a live test of `https://ridgeline-roofing.com/`: *"assets weren't loaded, like the
+video playing in the background of the form; the formatting of the header is off; Icon SVG are
+missing… instead of replicating with speed, i rather do accuracy."* Then, on how: *"top priority
+is that the site should always be up and not go down."*
+`engine/renderService.ts` + the render-first path in `engine/replicate.ts`.
+
+⚠️⚠️ **ALL THREE SYMPTOMS WERE ONE CAUSE, MEASURED.** That page carries **21 `data-src`
+attributes and 62 `loading="lazy"` images**, so nothing has a real `src` until its JavaScript
+runs; its icons are JS-injected (**zero inline `<svg>`** in the served HTML); and its layout
+needs JS-applied classes. After letting a browser run it: **104 of 104 images resolve**, the
+background video gains a source, and the header lays out correctly. Screenshots of both were
+compared side by side before any code was written.
+
+⚠️⚠️ **AND A FOURTH CAUSE THE CAPTURE PATH SHARED: 37 STYLESHEETS, ONLY 17 READABLE.** The
+capture script stripped `<link rel=stylesheet>` and inlined only the sheets it could read from
+script — throwing away the 20 cross-origin ones, which is its own version of the broken header.
+**A stylesheet loads cross-origin perfectly well; CORS only governs READING its rules.** The
+links now stay, and the inlined copy is belt-and-braces. Both paths fixed.
+
+⚠️⚠️ **THE RENDERER RUNS OFF-BOX, AND THE "FALLBACK" I FIRST PROPOSED WOULD NOT HAVE PROTECTED
+ANYTHING.** Render enforces memory **per container**, so a Chromium in this service counts
+against the same limit as Node; when that limit is crossed the kernel kills the process and **no
+`catch` block runs** — the platform restarts and every SE mid-demo drops. A `try/catch` around
+the renderer handles crashes, timeouts and blocks, none of which was the stated risk. The only
+structural answer is to put the browser in somebody else's container, which makes the worst case
+"a less accurate replica" rather than "a down platform". Said plainly to the user rather than
+shipping the weaker mitigation.
+
+⚠️ **BROWSERLESS `/content`, WHICH MEANS NO NPM DEPENDENCY.** It takes a URL and returns rendered
+HTML, so this is a `fetch` — no Playwright, no puppeteer-core, no Chromium download. Same
+reasoning that rejected a 26MB SDK for one button in `engine/voicePreview.ts`. Free tier is 1k
+units/month with no card, which covers this comfortably. `BROWSERLESS_URL` can point at a
+self-hosted instance later without touching code.
+
+⚠️ **UNCONFIGURED IS A SUPPORTED STATE.** With no `BROWSERLESS_TOKEN` the fast fetch is used
+exactly as before — nothing is gated on somebody buying anything — and the screen SAYS it is the
+fast copy. That matters: a page missing its lazy images looks like a badly built replica rather
+than a fallback, and the SE has no way to tell, which is how this feature lost trust the first
+time. Every degraded path carries its reason to the banner.
+
+⚠️⚠️ **A CIRCUIT BREAKER, BECAUSE A DEAD RENDERER WOULD OTHERWISE COST EVERY SE THE FULL
+TIMEOUT.** Three consecutive failures and it stops asking for five minutes, then lets one probe
+through. Verified with a deliberately bad token: requests 1–3 fall back in ~200–760ms each
+naming "the token was rejected", the breaker opens, and request 4 skips the service entirely.
+Without it every click would sit for 20 seconds against a service that is down.
+
+⚠️ **`waitUntil: "networkidle2"` PLUS `bestAttempt: true`.** Lazy images and injected SVG arrive
+AFTER `load`, so waiting for the network to quieten is what buys the accuracy; `bestAttempt`
+returns what it has rather than nothing, because a marketing page with a chat widget or an
+analytics beacon may never go fully idle and a perfectly good render would otherwise be thrown
+away on a timeout.
+
+⚠️ **A BODY UNDER 500 BYTES IS TREATED AS A BLOCKED STUB** and falls back, per Browserless's own
+bot-detection note. Sites that 403/429 a datacenter IP (AutoNation, Orlando Health) still fail —
+`/unblock` with residential proxies is the paid answer and is not wired up.
+
+⚠️ **`/api/status` GAINED `renderConfigured` — a BOOLEAN.** That endpoint is PUBLIC, so it names
+no token and no URL, the same rule the other integration flags follow.
+
+⚠️⚠️ **A TALL VIEWPORT BROKE THE HERO, AND IT WAS MY OWN OPTIMISATION.** Trying to drag more
+below-the-fold lazy images into range with `viewport: {height: 2400}` won four extra images and
+wrecked the page: ridgeline-roofing.com sizes its hero in `vh`, so a 2400px-tall viewport made
+the hero 2400px tall and two carousel slides' text rendered on top of each other — **the exact
+"formatting of the header is off" complaint, reintroduced by a performance tweak.** Caught by
+screenshotting the served result against the live site rather than trusting the element counts,
+which looked fine (`swiper-slide-active` was 1 in every variant). **1440x900 is the viewport;
+fidelity is the whole point of this path.**
+
+⚠️ **THE OPTION SET WAS MEASURED, NOT ASSUMED** — three renders of the same page against the
+real service: `networkidle2 + bestAttempt` 14.0s, `domcontentloaded + 4s wait` **7.0s for
+byte-identical output**, the tall-viewport variant 7.1s with a broken hero. A marketing page
+with a chat widget never goes network-idle, so `networkidle2` just burns the timeout and
+`bestAttempt` returns what it had anyway.
+
+**Verified live on the reported URL** once `BROWSERLESS_TOKEN` was set: the replica is a faithful
+copy of ridgeline-roofing.com — green inspection form in the hero, "KEEPING THE SOUTHEAST
+COVERED", roof photograph, nav, chat widget — and the banner reads "rendered in a browser".
+⚠️ **ITS FORM IS WPFORMS, WHOSE FIELD NAMES ARE OPAQUE** (`wpforms[fields][23]`), and
+`deriveFieldMap` mapped all six purely from their LABELS. That is the case a name-based table
+could never have covered, and the reason the classifier reads the rendered DOM. Filling it and
+clicking its own **Submit** created the lead with the message and ZIP 85018 resolved to Phoenix.
+
+**`npm run audit:replicas` gained 11 checks** covering the half that matters: unconfigured
+reports itself and still serves a page, a rejected token degrades **every time** rather than
+erroring, the breaker trips, short-circuits while tripped and recovers, a working service is
+actually used, `sanitizeReplica` keeps stylesheet links / drops preloads / strips form actions /
+adds `<base href>`, and the capture tool no longer strips stylesheets.
+⚠️⚠️ **THEY RUN AGAINST A MOCKED `fetch`, AND THE FIRST VERSION DID NOT — reporting three
+failures that were entirely the probe's fault.** It used `https://example.com/`, which is not
+reachable from this environment, so `fetchReplica` threw and three checks "failed" on correct
+code. An audit that depends on somebody else's site is flaky by construction; this is the same
+rule `audit:advanced` already follows for Gong.
+⚠️ A fourth probe fault in the same pass: the mock page was ~200 bytes, which the stub guard
+correctly rejects, so the happy-path check failed for a reason unrelated to the code. Fixtures
+have to clear the thresholds the code enforces.
+
+## Replicate — the prospect's OWN booking page, with its form wired in (9/12/2026)
+Asked for from the Book online menu: *"add another button called replicate, and what it does is,
+it replicates the given webpage with the form on it, so that way when the form is completed and
+'submitted' on the fake replicated website then it can actually take the information from the
+form and do stuff with it. like create a SMS workflow with the information from lead form."*
+`scripts/capture-replica.js` → `public/replicas/<slug>.html` → `src/data/replicaPages.ts` →
+`/replica/:slug`.
+
+⚠️⚠️ **THIS IS NOT WHAT WAS REJECTED TWO SECTIONS DOWN, AND THE DIFFERENCE IS THE WHOLE POINT.**
+That section killed replicating *ServiceTitan's* form — one form matching nobody, on a product
+only 2 of 15 prospects use. Replicating **whatever is at the URL** is per-prospect by
+construction, which is exactly the objection ("every prospect has a different form") that killed
+the earlier idea.
+
+⚠️⚠️ **A SERVER CANNOT DO THIS, AND IT WAS MEASURED BEFORE A LINE WAS WRITTEN.** These forms are
+JavaScript widgets:
+
+| | `curl` | a real browser |
+|---|---|---|
+| Aptive `/build-a-plan/` | **0 forms** | **1 form, 38 inputs** (the real First/Last/Email/Phone/Zip) |
+| AutoNation | **403** | loads fine, 59/59 readable stylesheets |
+| 10 prospect booking pages | **1 of 10** had a real lead field | — |
+
+So "fetch and replicate on demand" would hand an SE a formless, unstyled page — silently — for
+about nine prospects in ten. Captures are made ONCE by a browser and ship in the repo; **the SE
+installs nothing and clicks one button**, which was the constraint that ruled out asking every SE
+to install SingleFile.
+
+⚠️⚠️ **THE CAPTURE IS NEUTRALISED AT SOURCE AND AGAIN AT SERVE, AND THAT IS NOT BELT-AND-BRACES
+PEDANTRY.** AutoNation's is a **Salesforce Web-to-Lead** form (`00N1U00000Utmts` and friends are
+Salesforce custom field ids) and Aptive's posts to Aptive's own lead API. A replica that kept its
+`action` would **file a real lead at the prospect's own company** the first time it was demoed —
+the one failure here that cannot be taken back. The serializer strips
+`action`/`method`/`target`/`onsubmit`, every `formaction`, every `on*` attribute, all scripts and
+all iframes; `ReplicaPage` re-strips on load and `preventDefault()`s every submit;
+`audit:replicas` asserts it **over the files on disk**, not over the code meant to have cleaned
+them. Verified to fire by putting an action back on a capture.
+
+⚠️⚠️ **THE IFRAME IS SAME-ORIGIN, WHICH IS THE ENTIRE MECHANISM.** The capture is served from
+`public/replicas/` by our own server, so `contentDocument` is reachable and the parent binds to
+the real form. That is the exact inverse of the ThoughtSpot and LSA-quote frames this file
+documents as unreadable — those are cross-origin. **Never add a `sandbox` that omits
+`allow-same-origin`**; every interception would silently stop and the form would just do nothing.
+
+⚠️⚠️ **TWO THINGS A CAPTURE FREEZES THAT COST REAL DEBUGGING TIME, both now handled:**
+- **A DISABLED CONTROL.** AutoNation's submit is captured as `<input type="button" disabled>` —
+  its own JS enables it once the form validates, and the capture has no JS. **A disabled element
+  dispatches no click at all**, so the listener attached perfectly and never fired, which reads
+  exactly like broken wiring. `wireFrame` removes `disabled` from controls it has just decided
+  to wire.
+- **A BUTTON THAT IS NOT A SUBMIT.** That same control is `type="button"`, driven by the removed
+  script, so it fires no submit event. `wireFrame` bridges click → submit for controls whose
+  label or name looks like one.
+
+⚠️ **LINKS ARE MADE INERT AT SERVE, NOT IN THE CAPTURE.** The page is full of real navigation
+that would take the SE to the live site mid-demo; the capture stays a true copy and the behaviour
+lives in `wireFrame`.
+
+⚠️ **SUBMIT FEEDS THE EXISTING PIPELINE — nothing new was built for the "do stuff with it"
+half.** The form's own field names are mapped by `replicaPages.fields` (no normalising at capture
+time, so the copy stays faithful) into the same `LsaQuote` the LSA dialog writes, so a submit
+produces the Salesforce lead, the customised SMS workflow and the Interactions payload exactly as
+a quote does. **`LsaQuote.source` distinguishes them**, optional and defaulting to `"lsa"` because
+the store is persisted and the measured LSA wording must not move.
+⚠️ **THE ZIP IS RESOLVED TO A CITY** through the same `/api/zip` the precise-location pill uses
+(30328 → Sandy Springs), because the captured payload names a place, not a postcode — and it
+falls back to the raw ZIP rather than making a submit wait on a network call.
+⚠️ **TWO OPENER SHAPES, because one did not fit both.** A web-form quote did not arrive "on
+Google", and these forms often have **no free-text box at all** (Aptive's has five fields and none
+is a message) — a fixed opener greeted a real person with `You told us: ""`. The quote is included
+only when there is one. ⚠️ And the two intros are whole SENTENCES rather than a shared stem: built
+as `this is <name> ${tail}.` the web variant read *"this is AutoNation thanks for reaching out"*.
+
+⚠️ **AUTONATION'S REPLICA IS NOT ITS `bookingPath` PAGE, deliberately.** `/appointment` is a
+multi-step scheduler behind a consent gate whose contact fields never appear on step one, so a
+capture of it shows a form an SE cannot fill. The replica is `/an-fleet-services`, a genuine
+single-page lead form. The two fields answer different questions — `bookingPath` is "where does
+Book online go", `replicaPages` is "which page can we actually replicate".
+
+⚠️ **SIZE: 1.7MB and 2.9MB.** Static files, never bundled, but this is a per-prospect feature
+rather than something to run across all 145.
+⚠️ **Needs internet at demo time** — assets resolve from the prospect's CDN via `<base href>`,
+the same property the saved Invoca Exchange page has.
+⚠️ **A CAPTURE FREEZES THE CAPTURING BROWSER'S STATE**, including hidden tracking fields
+(Aptive's came out carrying a `gclid` and `utm_campaign`). Harmless here — they are our own
+demo's fabricated values — but capture in a clean tab and never while signed in to anything.
+
+⚠️ **A DEV-ONLY `/api/replica-capture` ENDPOINT WAS BUILT AND THEN DELETED.** POSTing the HTML to
+the dev server is tidier than a download, and `curl` confirmed it worked — but from a real capture
+it fails with a bare `TypeError: Failed to fetch`, because every page worth capturing is HTTPS and
+the browser blocks mixed content to `http://localhost`. It could only ever be reached from an HTTP
+page, and a dev server that writes files from an unauthenticated body is not worth carrying for
+nothing. The capture is a download instead.
+
+**`npm run audit:replicas` is 28 checks** (also in `npm run audit`): per capture — no live
+script, no iframe, **no form action**, no inline handler, no `formaction`, a form present, a
+doctype, a `<base href>`, inlined CSS, every mapped field actually present in that HTML, a filled
+form yielding a lead and an empty one refused; plus the serving layer still re-stripping,
+preventing default and re-enabling disabled controls, and the capture tool still neutralising.
+⚠️ Its script counter **strips HTML comments first** — Aptive's page carries three commented-out
+`<script>` tags and a naive count reports a clean capture as dirty, the same fix `audit:place`
+needed.
+
+**Verified end to end with real clicks**: Replicate opens Aptive's actual booking page under our
+own bar; filling First/Last/Email/Phone/Zip and clicking **Contact Me** created the lead and
+"Aptive - SMS - Quote Request (Dana)" appeared in Agent Studio. On AutoNation, filling the fleet
+form and clicking its own **Request a Quote** produced *"Lead created for Marcus Bell"* with
+Company and Fleet size chips, `location: "Sandy Springs"` resolved from ZIP 30328, and the
+comments field carried into the SMS opener. A prospect with no capture (Roto-Rooter) is offered
+**no Replicate button at all**, and the route fails closed if the URL is typed.
+⚠️ **ONE DEBUGGING DETOUR WORTH NOT REPEATING: a stale module.** The click bridge was tested
+against a dev-server module that predated the edit and appeared not to work at all; instrumenting
+`wireFrame` to report what it wired showed `buttons: 2` after a reload. This file already records
+the Node-cache version of this trap for `engine/*`; the browser HMR version is the same lesson.
+
+## Marketing Source names the channels the demo can SHOW: Google LSA and ChatGPT (9/12/2026)
+Asked for from a Marketing Source breakdown: *"can you replace Youtube and facebook in the
+marketing source in all the dashboards and replace it Google LSA and ChatGPT."* Right change for
+a reason worth stating: this platform now demos a **Google Local Services ad** and a **ChatGPT
+sponsored ad**, and neither channel appeared anywhere in the attribution data an SE opens
+straight afterwards. `src/data/marketingSources.ts` + `sourceRows()` in `engine/core.ts`.
+
+⚠️⚠️ **A STRING REPLACE WOULD HAVE BEEN BADLY WRONG, AND THE MEASUREMENT IS WHY.** Across the
+145 profiles on disk these two words appear **370 times as a Marketing MEDIUM and 366 times
+inside a landing-page URL** (`utm_source=facebook`) against **97 in a source breakdown**. A
+medium legitimately IS "Facebook". So the rename walks structurally to the positions that MEAN
+Marketing Source — breakdowns whose `dimensionColumn` says so, and the ops section whose table's
+first column does — and `dimensionColumn` is the identifier rather than the title for the same
+reason Location Comparison finds its columns by header instead of by index.
+
+⚠️⚠️ **DONE AT LOAD, NOT AS A DATA MIGRATION.** 145 profiles carry these values locally and the
+shared library holds ~234 more that no local edit reaches. Same call `withoutAgentQaSignals`
+records — "changing the prompts alone would have fixed nothing an SE could see" — so
+`renameMarketingSources` runs as a profile enters `ProfileContext` and every screen is right by
+construction, live demos included. The engine asks for the new names too, so a prospect
+generated from now on is born correct and the rename is a no-op for it.
+⚠️ **BOTH ENTRY POINTS NORMALIZE** — the initial state (registry + localStorage cache) and
+`addProfile` (a fresh generation, or a library demo). Doing one and not the other is how a
+library demo renders Facebook while a bundled one renders Google LSA.
+
+⚠️⚠️ **`digitalInsights` IS DELIBERATELY UNTOUCHED, and that was measured rather than assumed.**
+The Digital Journey report prints **Marketing Source, Marketing Medium and the Full Landing Page
+URL in ONE VISIBLE ROW**, and on a Facebook source row all three say so (medium "Facebook" on 37
+of 38, `utm_source=facebook` on the same 37). Renaming only the source would print
+`Google LSA | Facebook | …utm_source=facebook` on one line — the contradiction this file already
+records twice. Moving the whole tuple means inventing utm conventions for ChatGPT that nothing
+in the demo emits, which is a decision to ask for. **It costs less than it looks: the two slices
+already use different source vocabularies** (Aptive's dashboard reads Google / Bing / Direct /
+Facebook / YouTube while its journey rows read Organic / Paid Search / Social Media), so they
+were never aligned and this introduces no new drift.
+
+⚠️ **EXACT VALUES ONLY.** A source row reading "Paid Social (Facebook/Instagram)" or
+"Facebook / Instagram" is a COMBINED channel; calling it "Google LSA" would be wrong rather than
+renamed. Measured: 8 such rows against 94 standalone ones.
+⚠️ **FACEBOOK -> GOOGLE LSA, WHICH INVERTS THE ORDER THE REQUEST LISTED.** Taken positionally it
+would be YouTube -> Google LSA; the measurement argues the other way — Facebook appears in 86
+profiles' source breakdowns and YouTube in 16, so this is what actually puts the channel we just
+built a screen for in front of most prospects. One line to flip.
+⚠️ **RENAME ONLY, NEVER AN INSERT.** A breakdown's rows are a partition whose metrics sum to the
+prospect's own call total. Relabelling preserves every sum by construction; adding a row would
+not. **Consequence, stated: 56 of 145 profiles carry neither value and so gain neither name.**
+
+⚠️ **ONE RULE, THREE PROMPTS.** Source rows are generated by `dashboardChannels`, `opsDashboard`
+AND `aiAgentConversion`; a rule pasted into two of them is how one dashboard says Google LSA and
+another says Facebook. `sourceRows()` is injected into all three and the audit fails below three.
+
+**`npm run audit:sources` (also in `npm run audit`) is 11 checks** over all 145 profiles: the
+exact-match rule and its refusal of compounds, the mapping, that **nothing outside a source
+position moved** (mediums, landing URLs, journey rows, row counts and every metric byte-identical),
+that no source row still reads Facebook/YouTube, idempotence, the untouched-profile identity path,
+and the prompt carrying the rule at all three sites while still permitting the MEDIUM.
+⚠️ Each was broken on purpose and seen to fire: widening to a substring match (the compound check
+reddens), dropping the ops chart from the rename (36 leaks + 41 survivors), and removing the rule
+from one prompt.
+⚠️⚠️ **TWO OF THOSE CHECKS FAILED ON CORRECT CODE FIRST — the eleventh and twelfth probe faults
+in this file.** One asserted every ops chart bar appears in its own table, which **five profiles
+never satisfied**: Hopscotch Primary Care's chart says "Paid Social" where its table says
+"Facebook (Paid Social)". That is a GENERATOR bug predating this work (the rename leaves both
+untouched, since both are compounds), so the check now measures "the rename must not make
+divergence worse" and the real defect is filed separately. The other looked for the prompt's
+finished sentence in `engine/core.ts` and found nothing, because the rule is built across a
+template-literal break (`` `…Marketing ` + `MEDIUM…` ``); adjacent literals are joined before
+matching now.
+
+Verified in the browser: Aptive's Calls by Source reads Google / Bing / Direct / **Google LSA** /
+**ChatGPT**, summing to its own 64,004 KPI exactly, with the Medium table untouched — and the two
+new rows land as the smallest-volume, highest-converting ones (58.2% and 64.5% against Google's
+44.3%), which is the "volume is not value" story this file already enforces. AutoNation's
+Marketing & Operations Source **table and its chart moved together**, no Facebook or YouTube
+anywhere on either page. Mattress Firm's Digital Journey report still shows Facebook as source
+AND medium on the same row, untouched on purpose.
+
+## The LSA conversation opens with Google's lead payload (9/12/2026)
+Asked for with a capture of the real thing attached — an **Interactions** report for a pest
+control advertiser (`reference/google-search/lsa-interactions-v1.html`): *"for the LSA
+submission, when setting up the SMS agent the first message only in the interaction report
+should always be 'You have received a new message from a customer via Google Local Services
+Ads. Customer Name: …, Location: …, Service: …, Message: … [Notes from LSA: This customer has
+requested a quote].'"* `lsaLeadMessage` in `quoteWorkflow.ts`, rendered by `buildConversation`.
+
+⚠️⚠️ **IT IS AN INBOUND MESSAGE, NOT THE AGENT'S GREETING — and the capture is what settles
+that.** It sits on the **Consumer** side of the thread, and the agent's own first reply follows
+it ("Thank you for contacting <business>. Reply STOP at any time to opt out…"). It has to be
+inbound: the text is addressed to the BUSINESS ("You have received…"), so making it the opener
+would be texting the customer a notification about themselves. Only the first message changes,
+exactly as asked — `quoteWorkflow`'s customized opener is untouched.
+
+⚠️⚠️ **IN THE REPORT, NEVER ON THE PHONE — which is why it is a parameter to
+`buildConversation` rather than a seeded `messages` entry.** The payload arrives on the
+business's inbound channel; the consumer never sees it, and putting a notification about
+themselves into the iPhone mockup would break the one screen that has to stay a believable
+iMessage thread. The phone renders `messages`; the capture renders this in front of them.
+Verified both ways: the report's first turn is the payload and the phone's first bubble is the
+agent's opener, with the payload string absent from the preview's DOM entirely.
+
+⚠️⚠️ **AN EMPTY SLOT KEEPS ITS LABEL, AND THAT IS MEASURED RATHER THAN TIDIED.** The captured
+payload reads `Customer Name: , Location: Lowell` — that advertiser's feed carried no name and
+the label stayed with nothing after it. Reproducing that is also what makes the field addition
+below safe. **The string is asserted character-for-character against the capture** (extracted
+from the saved HTML, not transcribed from the screenshot).
+
+⚠️ **`LsaQuote.location` IS NEW AND OPTIONAL, because the store is PERSISTED.** Google's payload
+names the consumer's city and the quote form never asks for one, so it comes from the search
+screen's own location (`d.shortCity` — the same value the unit prints as "Serves <city>", and
+the one the ZIP pill can re-point). Optional because a quote captured before this field existed
+is still in localStorage for up to seven days; it renders as the empty slot the real payload
+already uses, so an old record degrades into a correct-looking message rather than `undefined`.
+
+⚠️ **`smsInfo.totalMessages` COUNTS THE TRANSCRIPT, NOT `messages`.** With a lead-in the two
+differ by one, and an SMS Info card that disagrees with the transcript beside it is exactly what
+a prospect notices before we do. The lead-in also takes the earliest timestamp, with the rest of
+the thread shifted a minute, so the order on screen is the order it happened.
+
+⚠️ **THE HOOK IS CALLED UNCONDITIONALLY.** `wf && quoteForWorkflow(useQuoteCaptures()…)` reads
+naturally and puts a hook behind a condition, which React forbids and which would break the
+moment an SE opened a different preview. The slug is tested after the hook, not around it.
+
+⚠️ **A SIDE EFFECT WORTH HAVING: the payload reaches `/api/analyze`,** since signals are
+extracted from `conv.transcript`. Measured on a real submission, the Analysis tab came back with
+"Service Area Confirmed: Phoenix", "Service Type: Recurring Residential Pest Plans" and "Pest
+Type Identified: Carpenter Ants" — all grounded in the form, none of which the chat alone said.
+
+Verified end to end by submitting a real quote through the dialog (Aptive, Phoenix): the record
+stored `location: "Phoenix"`; the Interactions report's first turn is the payload on the Consumer
+side, character-identical to the template with all four fields filled; the phone shows only the
+agent's opener; `totalMessages` reads 4 against a 4-turn transcript. **Untouched and checked: the
+built-in agent's preview (no `?wf=`) still captures a 3-turn conversation beginning with its own
+stored greeting and no lead-in.** `audit:ai` and `audit:place` green, typecheck clean.
+⚠️ A note for the next person driving this form in a browser: the contact field's centre sits
+under the dialog's sticky footer until the body is scrolled, so a click at its centre hits the
+footer. That is ordinary scrollable-dialog behaviour, not a defect — scroll first.
+
+## "Book online" is a tracked handoff, and the beat ENDS there (9/12/2026)
+Asked as a question — *"each prospect has a unique form, so what do you recommend?"* — and
+settled by measuring the capture rather than guessing. **This section exists so the "let's
+build the booking form" idea is not relitigated; it was considered, costed and rejected.**
+
+⚠️⚠️ **GOOGLE DOES NOT HOST THIS FORM.** In `reference/google-search/lsa-quote-v1.html`,
+"Book online" is an `<a href>` to `google.com/localservices/booking?ebd=<base64>`, and that
+blob decodes to the advertiser's OWN booking system plus a Reserve-with-Google token:
+
+| advertiser | destination |
+|---|---|
+| 6 of 8 | **ServiceTitan** — `book.servicetitan.com/<tenant-id>` |
+| Roto-Rooter | its own page — `rotorooter.com/schedule-service/?zipCode=30318&gad=789-200-3717` |
+| 1 | a third-party form builder — `form.recreateai.com/?rai_pak=<uuid>` |
+
+Every destination carries `rwg_token=AE37R_…`.
+
+⚠️⚠️ **SO THERE IS NO SINGLE FORM TO REPLICATE — two independent reasons, both measured:**
+  1. **Per-TENANT variance.** Even among ServiceTitan advertisers the services, fields and
+     branding are configured per business, so one replica matches none of them. (Raised by the
+     user, and correct.)
+  2. **WRONG VERTICAL FOR ALMOST EVERYONE.** ServiceTitan is a home-services product, and only
+     **2 of the 15 profiles on disk are home services** — the other 13 are healthcare, hotels,
+     auto, insurance, senior living, retail and moving. Orlando Health does not book through
+     ServiceTitan.
+
+⚠️ **A NEUTRAL, PROSPECT-BRANDED BOOKING PAGE WAS DESIGNED AND ALSO REJECTED** — by the user,
+and it was the right call: it would be a form nobody's prospect actually uses, presented as
+theirs, which is the same failure mode as every other invented-content refusal in this file.
+
+⚠️⚠️ **AND NOTHING CAN COME BACK FROM THE REAL FORM, WHICH IS HONEST RATHER THAN A GAP.** The
+question asked was whether the click could carry a tag that pushes the submission back into the
+demo. It cannot: those URLs are live tenants belonging to REAL named businesses (Keep Smiling
+Plumbing, Cool Air Mechanical, Plumb Works are all in the capture) so submitting one books an
+actual service call; a third-party page is cross-origin with no `postMessage` contract and no
+webhook we can receive; and `rwg_token` is Google's tag, not Invoca's.
+**What makes a form submission reach Invoca in the real world is `InvocaJS` deployed on the
+advertiser's own booking page** — it finds the form in the DOM, injects a hidden field carrying
+the Invoca id, and captures the values client-side. That is a property of THAT page, not of this
+click, and it is a selling point rather than a limitation. The tag half already exists here:
+every outbound link on this screen carries `oppref`.
+
+**What was built instead:** `bookingHandoffUrl()` — the prospect's own site with `oppref`,
+`utm_medium=lsa`, `utm_content=book_online` and a deterministic `rwg_token`. ⚠️ The token is
+fabricated for exactly the reason `gclid` already is on this screen: it is the parameter that
+marks a booking click as coming from the ad, so omitting it would drop the thing being
+demonstrated.
+⚠️ **PROSPECT ROW ONLY.** The rival is an invented business with an invented domain, so its
+"Book online" stays an inert span — linking it would open a 404, the same reason its ad headline
+is inert while the prospect's is a real link. "Get phone number" stays inert on both rows: no
+captured destination.
+
+Verified: the prospect's button is an `<a target="_blank" rel="noopener noreferrer">` carrying
+all five parameters, the rival's and both "Get phone number" are still spans, and an 11-property
+re-measure shows the unit unchanged (341 tall, rows 116, circles 44x44 at y=17, actions ending
+at 642, label still `500 14/18 #a8c7fa` on two lines with no underline).
+
+### ⚠️⚠️ CORRECTED SAME DAY — it was landing on the HOME page, which is not what the real one does
+Reported directly: *"the book online link is just taking them to their website, it needs to take
+them to the actual page to what happens when they click book online, for example when you click
+on the book online for Roto Rooter it takes them to URL:
+`www.rotorooter.com/schedule-service/?zipCode=30328&gad=138-660-5452&rwg_token=AE37R_…` and not
+the home page."* Right, and the decoded `ebd=` blobs above say the same thing — the handoff lands
+on the advertiser's own BOOKING page. `bookingHandoffUrl` was setting every parameter correctly
+onto the front door. `src/data/bookingPath.ts` is a `domain -> path` table it now consults.
+
+⚠️⚠️ **A TABLE, NOT RUNTIME DISCOVERY, AND THAT WAS MEASURED RATHER THAN ASSUMED.** The obvious
+build is the `engine/ogImage.ts` pattern: fetch the site at view time and find the booking link.
+Probed across the library, it fails for exactly the prospects that matter — **AutoNation 403,
+Mattress Firm 403, Orlando Health 429**, the same enterprise blocking `ogImage` already records —
+and three more are SPAs whose CTA is not in the served HTML. A BROWSER reaches all six (that is
+how their paths were resolved), a server cannot, so runtime discovery would quietly drop the
+biggest brands to the home page. A demo link must also not depend on whether somebody else's site
+answers a fetch mid-pitch.
+
+| resolved by | |
+|---|---|
+| server fetch | rotorooter.com **`/schedule-service/`**, aptivepestcontrol.com `/build-a-plan/`, keywhitman.com `/lasik/schedule-online/`, nationalvanlines.com `/free-moving-quote/` |
+| a browser (these 403/429 a server) | autonation.com `/appointment`, orlandohealth.com `/request-an-appointment`, mattressfirm.com `/en-us/stores/` |
+| read off the rendered page (SPAs) | comfortkeepers.com `/care-assessment/`, vectorsecurity.com `/services/` |
+
+⚠️⚠️ **ROTO-ROOTER IS THE CONTROL, AND IT MATCHES THE REAL DESTINATION CHARACTER FOR
+CHARACTER.** The discovery found `/schedule-service/` independently, which is the path in the
+live Google LSA link quoted above — that is the evidence the rest of the table is the right KIND
+of page rather than a plausible-looking contact form.
+
+⚠️ **PATHS ONLY, NEVER A QUERY STRING.** The real URL also carries `zipCode=30328` and `gad=…`,
+but those are ADVERTISER-SPECIFIC parameters Google fills in for a page that accepts them;
+appending a zipCode to a prospect whose booking page has no such field would be inventing an
+integration. The generic tokens (`oppref`, the utm set, `rwg_token`) are still appended for every
+prospect, because those are Google's and Invoca's own.
+
+⚠️ **AN UNKNOWN PROSPECT FALLS BACK TO "/" — the home page, which is never a 404.** The platform
+generates new prospects constantly and none of them is in this table; **Goosehead is in it today**
+(the discovery found no booking link on that site at all). A guessed path (`/book`, `/schedule`)
+404s in front of a customer, which is worse than landing one click away.
+
+Verified in the browser on four prospects: Roto-Rooter renders
+`https://rotorooter.com/schedule-service/?oppref=…&utm_medium=lsa&utm_content=book_online&rwg_token=AE37R_…`,
+Orlando Health `/request-an-appointment`, and Goosehead falls back to `https://goosehead.com/`
+with `oppref` and the `rwg_token` still attached. The unit is unchanged (341 tall, 652 wide, rows
+116, thumb 92x92, 5 actions of which exactly 1 is a link). `bookingPath` normalises protocol,
+`www.` and case (unit-checked); `audit:place` green, typecheck clean.
+
+### Right-click it and the SE picks the destination (9/12/2026)
+Asked for straight after the table landed: *"when i right click on the book online it gives the
+user the option to enter the URL where they want the button to take them to when its click, so
+there will def be a default place it goes, but the user can also change it."*
+`src/data/bookingOverride.ts` (the store, `.gs-lnk-*` for the panel).
+
+⚠️⚠️ **THIS IS WHAT MAKES `bookingPath` A DEFAULT RATHER THAN A CEILING.** That table is
+hand-resolved, so it can only ever cover prospects somebody has looked up — and the platform
+generates new ones constantly, booking pages move, and a regional franchise books somewhere the
+national site does not. Every one of those is an SE with the right URL in their clipboard and,
+until this, no way to use it.
+
+⚠️⚠️ **A RIGHT-CLICK IS THE ONLY REASON THIS CAN LIVE ON A REPLICA SCREEN.** Every pixel of the
+unit is measured against a capture, and the standing rule is that an affordance of ours must not
+change what a prospect sees. At rest this adds nothing — no control, no marker, **not even when
+an override is in force** — so the unit still diffs clean (re-measured after: 652x341, rows 116,
+thumb 92x92, circles 44x44, 5 actions, 1 link). Same argument as the hover-revealed Ask AI
+sparkle. The one concession to discoverability is a native `title` on the link, which is what
+"Use precise location" already does on this same screen.
+
+⚠️⚠️ **AN OVERRIDE OPENS VERBATIM — IT DOES NOT GET THE TRACKING ENVELOPE, and that is a
+deliberate trade.** The default is wrapped in `oppref` + the utm set + `rwg_token` because that
+is the demo's own point. An overridden URL is not: the instruction was "take them to this URL",
+and what an SE pastes is very often a real booking link copied complete with its own parameters
+(the real Roto-Rooter destination carries `zipCode` and `gad`). Rewriting a pasted link's query
+is how you break one, and appending ours beside theirs reads as a bug the moment they look at
+the address bar. **Consequence, stated: an overridden link carries no `oppref` unless the SE
+includes one.** The menu shows the default underneath so what was replaced is never hidden.
+
+⚠️ **PROSPECT'S ROW ONLY.** `onContextMenu` and `title` are opt-in props on `LsaAct`, defaulted
+absent, passed only by the prospect's "Book online" — verified live: of the five actions exactly
+one carries them, the rival's is still an inert `<span>`, and right-clicking it does not open the
+panel. "Get quote" opens the dialog and "Get phone number" has no destination, so neither takes
+one either.
+
+⚠️ **PER PROSPECT, PERSISTED, NO TTL** — the same shape and reasoning as `locationOverride`, and
+verified live: an override set on Roto-Rooter survives a reload and does NOT follow a switch to
+Orlando Health, which still resolves its own `/request-an-appointment` default.
+
+⚠️ **ONLY http AND https ARE STORED**, checked at the one place that writes and again on read.
+The value goes straight into an `href`, so a `javascript:` URL would be script on our own origin.
+⚠️⚠️ **THE SCHEME TEST IS `scheme://`, NOT A BARE COLON — the first version refused a good URL.**
+`[a-z0-9+.-]*` happily matches `example.com`, so `example.com:8080/book` was read as the scheme
+"example.com:" and rejected. Requiring the slashes still catches both dangerous shapes by two
+different routes: an opaque `javascript:alert(1)` gets the `https://` prefix and `new URL` throws
+on its non-numeric "port", while `javascript://…` keeps its protocol and the allow-list refuses
+it. Both measured, along with a hostname-needs-a-dot rule (a bare `rotorooter` is a typo here,
+not an intranet host, and finding out mid-demo is worse than being told now).
+
+⚠️ **THE INPUT SELECTS ALL AND SCROLLS BACK TO THE START, and `setSelectionRange(…, "backward")`
+IS NOT ENOUGH ON ITS OWN.** A plain `.select()` leaves the caret at the end and the field follows
+it, so the tracked default — which is mostly query string — opened showing `…&rwg_token=AE37R_…`
+with the domain out of view. Measured after switching to a backward selection: direction came
+back `"backward"` and `scrollLeft` was still 16. The explicit `el.scrollLeft = 0` is what does
+the work.
+
+⚠️ **OUTSIDE-CLICK IS POINTERDOWN IN THE CAPTURE PHASE**, per the trap the Signal flyout and the
+Create-Workflow combobox already record.
+
+⚠️⚠️ **AND ONE "BUG" WAS THE TEST HARNESS — the eleventh in this file.** Enter appeared to do
+nothing: the panel stayed open, no error, nothing stored, while a real click on Save worked
+perfectly. The Browser pane's `computer {action:"key", text:"Return"}` dispatches a **trusted
+keydown with an EMPTY `key` and `code`** (logged from a capture-phase listener), so
+`e.key === "Enter"` can never match. **Never conclude a key handler is broken from that tool
+alone** — dispatch a real `KeyboardEvent` instead, which is how both Enter (saves and closes)
+and Escape (closes) were actually confirmed.
+
+Verified end to end with real right-clicks, real typing and real clicks: the panel opens at the
+cursor prefilled with where the button goes now; `rotorooter` is refused with "That does not look
+like a full web address" and stores nothing; `book.servicetitan.com/tenant/9f2b?campaignId=demo`
+saves as `https://…` with their own query intact and the link re-points immediately; reopening
+shows Reset plus the full default underneath; Escape, an outside click and Cancel all close; and
+Reset restores the tracked default and clears the key. `audit:place` and `audit:ai` green,
+typecheck clean.
+
+#### Replicate ENDS in the menu now: Complete, saved, and no navigation (9/15/2026)
+Asked for directly: *"when i click replicate, show the progress bar like its doing now, but once
+its done, just show complete, but dont go to it, auto save the page, so when the user click book
+online it goes to the replicated page."*
+
+The capture already happened before the old version navigated — that is why the wait is in this
+panel at all — so opening the replica was the one part that cost something: it threw the SE off
+the search screen they were demoing from, and left them to come back and re-point Book online by
+hand. The capture is on disk either way, so the useful end of the action is the DESTINATION being
+set. On success it now calls `onSet("/replica?url=…")` and reports Complete; the panel stays open.
+
+⚠⚠ **IT WRITES THROUGH `onSet`, NOT A SECOND WRITER**, so it inherits the store's validation, the
+per-prospect key, the persistence and the **Reset** that puts the tracked default back — and the
+"Default: …" line appears underneath the moment it lands, which is what tells the SE the link was
+genuinely re-pointed rather than merely claimed to be.
+
+⚠⚠ **AND THAT IS EXACTLY WHERE IT WOULD HAVE SILENTLY FAILED.** `normalizeUrl` refuses a hostname
+with no dot (a real rule: "rotorooter" is a typo, not an intranet host), and a `/replica?url=…`
+path has no host at all — so the save would have come back "That does not look like a full web
+address" and the SE would see an error where a receipt belongs. Worse, the obvious workaround of
+storing `${location.origin}/replica…` fails the SAME rule on **localhost** while working on the
+live site, i.e. broken for every SE testing it and fine in production. A **same-origin path branch**
+now returns the value verbatim, above every other rule.
+⚠ **`//host/path` IS EXCLUDED** — a protocol-relative URL is somebody else's origin wearing a
+path's clothes. One leading slash cannot carry a scheme, so `javascript:` stays unreachable by
+that branch and the existing guard still owns every other shape.
+
+⚠⚠ **AND THE BOX HAS TO BECOME THE REPLICA TOO — leaving it alone was a REAL BUG, reported as
+"it still takes me to the real website".** The link genuinely WAS re-pointed; then **Save** stores
+whatever sits in the input, which was still the ORIGINAL site URL, silently clobbering the replica
+that had just landed. Confirmed from the SE's own stored state: `bookingUrl` held the raw
+`https://www.greenixpc.com/contact-us` while a capture of that very page sat on disk. That click
+is the natural next move now that the panel **stays open** instead of navigating away, so the old
+flow could never expose it — **a change that removes a navigation can make a pre-existing button
+reachable at a moment it was never meant for.** It also broke this panel's own rule that the field
+shows where the button goes RIGHT NOW. `setValue(replica)` on success fixes all of it: Save
+re-saves the same thing, reopening shows it, and there is no way to overwrite it by accident.
+⚠ `setValue` fires no `onChange`, so Complete deliberately survives it — only a human editing the
+field clears the receipt.
+
+⚠ **THE BAR FINISHES AT 100 RATHER THAN DISAPPEARING.** A progress bar that vanishes at the end is
+indistinguishable from one that was cancelled, and this flow no longer navigates away to prove it
+worked — so the same row stays, fills, and reads **Complete**, with the button doing the same.
+⚠ **`.gs-lnk-prog-done` IS WRITTEN `.gs-lnk-prog .gs-lnk-prog-done` (0,2,0).** `.gs-lnk-prog-pct`
+pins `width: 34px` (room for a percentage) and is defined LATER in the file, so a bare class would
+TIE and lose on source order — "Complete" clipped to 34px while the rule read perfectly. Same tie
+`.ts-tablewrap .ts-table` and `.wf-leaf .wf-leaf-add` exist to win. Verified `scrollWidth ===
+clientWidth` on the rendered label.
+⚠ **Complete is GREEN, not a faded `:disabled`** — the state is success, not unavailability.
+`.gs-lnk-btn` deliberately carries no `:disabled` opacity, so it reads at full strength while
+still refusing a second click. **Typing a new URL clears the receipt**, or Complete would be
+describing a capture of a different page.
+
+**`npm run audit:replicas` gained 9 checks**: the box becomes the replica so a following Save
+cannot clobber it, the replica path stores verbatim with its query untouched, `//host/path` is not treated as same-origin, both `javascript:` shapes are still
+refused, the needs-a-dot rule still fires, the success path calls `onSet` with the replica route,
+it no longer navigates, the Complete state exists, and editing the URL clears it.
+⚠ Verified to FIRE by disabling the path branch and by restoring the navigate (3 red), then
+restored to green.
+
+**Verified live on Aptive** with real right-clicks and clicks: Replicate ran to 100%, the page
+stayed on `/google-search`, the bar and the button both read Complete in `#6dd58c` with no
+clipping, `invoca-demo:booking-url::aptive` held `/replica?url=…`, and "Default: …" appeared
+underneath. Book online then opened the replica — Aptive's real form, **1 form / 38 inputs** — the
+override survived a reload, and **Reset restored the tracked `oppref` link and cleared the key**.
+The unit itself is unchanged: 652x341, 5 actions of which exactly 1 is a link.
+
+#### And the saved link travels with the DEMO now, not just the browser (9/15/2026)
+Asked for straight after: *"it should always stay and save even when the users closes it and
+opens it the next day."*
+
+⚠️ **THE NEXT-DAY HALF ALREADY HELD, and saying so is the honest start.** localStorage has no
+expiry and this store never had a TTL. What made it look otherwise was **me clicking Reset at the
+end of the previous verification** and leaving the demo in that state — the SE then saw the real
+URL and reasonably read it as the save not sticking. **Finish a verification in the state the
+feature is meant to be in**, or the last thing you prove is the teardown.
+
+What localStorage genuinely could NOT do is leave the machine: a colleague opening the same demo,
+the same SE on a second laptop, or the live site after a link was saved on localhost, all fell
+back to the tracked default with nothing on screen to say why.
+
+⚠⚠ **SO THE VALUE RIDES THE OVERRIDE LAYER THAT ALREADY TRAVELS — no server change, no schema
+change, no migration.** `AiAssistantContext`'s store is keyed `<demoId>::<path>`, is written to
+localStorage on every change, is PATCHed onto the shared demo record debounced and owner-only, and
+is re-hydrated by `hydrateDemo` for anyone who opens that demo. The link is written there as
+`bookingUrl` under **`<profileId>::/google-search`** (`bookingScopeKey`, one definition — it is
+half of a key the sync slices on, and two copies is how one side writes a key nobody reads).
+⚠ **A LIBRARY DEMO'S `profile.id` IS ITS DEMO ID**, which is the whole reason a key built from
+`profile.id` lands inside the `<demoId>::` prefix the PATCH effect slices on. A key built any
+other way is never synced and **nothing reports it** — which is what the audit pins.
+
+⚠ **`registerBase`, NEVER `registerScope`** — the latter is last-write-wins and would repoint
+whatever sparkle the SE has open at this screen's one field. And the base is seeded `""`, so the
+first save is a string-to-string write rather than the `undefined -> string` TYPE FLIP `editGuard`
+refuses — the trap the greeting, `serviceZips` and the voice picker each had to be let through by
+name. Writing through `applyEdits` also inherits `readOnly` on somebody else's demo for free.
+
+⚠⚠ **THE LOCAL KEY SURVIVES AS THE FALLBACK, AND IT IS LOAD-BEARING RATHER THAN LEGACY.**
+`applyEdits` returns 0 for a demo the SE may not edit and for a bundled profile that is no library
+demo at all — both are real, and in both the SE still needs to point the link at a replica for the
+conversation they are having. **Precedence is local, then shared**, and a successful shared save
+CLEARS the local copy: a local value therefore exists only when the shared write was refused, i.e.
+only when it is genuinely that SE's own and should win on their own machine. Without the clear, an
+owner re-pointing the link on one laptop would leave the other reading a stale local copy forever.
+⚠ **Reset clears BOTH, unconditionally**, or the old link is back on the next render.
+
+**`npm run audit:replicas` gained 8 more checks** (16 in total for this feature): the scope key is
+`<profileId>::<path>`, it is a bare pathname, the base is seeded `""`, it registers a base and not
+a scope, a save tries the durable layer first, a successful shared save clears the local copy, the
+precedence is local-then-shared, and Reset clears both.
+⚠ Three were broken on purpose and seen to fire — renaming the key out of the sync prefix,
+inverting the precedence, and leaving the local copy behind.
+
+#### What the page says after a submit — revealed where it exists, pointed at where it does not (9/16/2026)
+Asked directly: *"are you able to also replicate what happens when someone click submit. like
+sometime it goes to a different page, or sometimes it just says thank you etc."* Answered by
+MEASURING the captures rather than guessing, and the three outcomes are genuinely different:
+
+| capture | after submit | in the capture? |
+|---|---|---|
+| Aptive | an inline thank-you panel with "What happens next" | **yes** — real markup carrying `hidden=""` |
+| Greenix | a HubSpot inline message | **no** — only the CSS that would STYLE `.submitted-message`; the text comes from HubSpot's JS |
+| Reyes Law, AutoNation | unknown | no trace either way |
+
+**1. Where the page ships its own confirmation, the replica reveals it** — `findConfirmation` +
+`revealConfirmation`. This is replication, not invention: the words are the prospect's own and
+revealing them is exactly what the site's script does. Aptive renders "Thank You! Dana — A pest
+control specialist will contact you shortly…" with its own next-steps list, and the form is
+hidden underneath, because a thank-you panel above a still-editable form reads as the submit not
+having happened.
+⚠ **THREE GUARDS KEEP IT FROM FIRING ON SOMETHING ELSE:** the node must be HIDDEN (an already
+visible one is page furniture), must carry ≥12 characters of text (HubSpot leaves a styled EMPTY
+shell, and revealing a blank box reads as the page breaking), and must hold no form fields.
+⚠ **AND IT MUST FAIL CLOSED**, which is most of the design: Greenix produces zero candidates in
+the rendered DOM, so nothing happens and the submit stays silent exactly as before. A generic
+"Thanks!" there would be inventing a company's own confirmation copy.
+⚠ **A REFUSED SUBMIT SHOWS NOTHING.** `onSubmit` returns whether a lead was created, and the
+reveal is gated on it — otherwise the screen thanks someone while an error says it failed.
+⚠ **THE NAME SLOT IS THE PAGE'S OWN.** Aptive leaves `<span class="…thankyou-name"></span>` for
+its script; filling an EMPTY such element is still replication. ⚠ It reads the MAPPED lead, not
+the raw field bag — written as `values.name` first, which silently left it blank because `values`
+is keyed by the form's own input names (`firstName`, `hs-firstname`, `wpforms[fields][3]`).
+
+**2. Where it does not, the SE points at the real page** — an "After submit, show" field on the
+same Book online menu, stored beside the booking link in the SAME object (they describe one page;
+a second store is a second thing to forget to clear). On a successful submit the frame navigates
+there, resolved through the same lookup the main frame uses, so a captured page is instant and an
+uncaptured one still works through the live fetch.
+⚠ **RESOLVED WHEN THE PAGE OPENS, READ THROUGH A REF.** Looking it up on submit would put a round
+trip in the one moment anyone is watching; and putting it in the bind effect's deps would RE-WIRE
+every form each time it resolved — while a plain closure read would be the empty string exactly
+when it matters, since the lookup lands after the first bind.
+⚠ **`thankYouUrl` HAD TO JOIN `CREATABLE_WHEN_ABSENT`.** A demo that saved a booking link before
+this field existed has an override of `{ bookingUrl }` alone, so the first write on exactly those
+demos is an `undefined -> string` flip — it would have worked on a fresh demo and silently failed
+on the ones most likely to be set up already. Fourth time this trap is recorded here.
+⚠ **THE SE'S PAGE WINS OVER A BLOCK WE MERELY RECOGNISED**, and **Reset clears both** — a
+post-submit page outliving the link it belonged to is the same stale leftover.
+⚠ **NO LOCAL FALLBACK FOR THIS ONE, deliberately**, unlike the booking link: a post-submit page is
+part of how the demo is BUILT, so it belongs to the demo or nowhere. A refusal says so rather than
+no-opping.
+
+**`npm run audit:replicas` gained 11 checks**; two were broken on purpose and seen to fire (the
+empty-shell guard, the created-lead gate). ⚠ Three EXISTING checks had to be **re-aimed** when the
+store gained a second field — same invariants, new shape.
+
+**Verified with real clicks on both paths**: Aptive's own panel appears with the form hidden and
+the name filled; Greenix finds nothing and stays silent; and with an after-submit page set, a
+Reyes Law submit created the lead AND swapped the frame to that page's capture.
+
+#### ⚠⚠ "Replicate said Complete and Book online opens a BLANK page" — on PRODUCTION only (9/15/2026)
+Reported the moment `BROWSERLESS_TOKEN` went live. The capture had genuinely been made; the
+screen framed a path that does not exist on a deploy, and **nothing anywhere reported a
+failure** — which is what made it blank rather than broken.
+
+The chain, confirmed on the live site rather than reasoned about:
+1. `replicaPages.ts` registers `aptivepestcontrol.com` → the STATIC `public/replicas/aptive.html`.
+2. `ReplicaPage` short-circuited on that registry **in the browser** and never asked the server.
+3. It framed `/replicas/aptive.html`.
+4. That file is **git-ignored on purpose** (megabytes; pruned after 10 days), so no deploy has it.
+5. `express.static` missed — and `app.get("*")` served **`index.html` INTO THE IFRAME**. Measured
+   live: that URL returned **200** carrying `<div id="root">` and `/assets/index-…`. The app
+   rendered itself inside the frame with no route: blank.
+6. Meanwhile the capture Browserless had just made sat unused in the dynamic store.
+
+⚠⚠ **THE ROOT CAUSE IS A CLIENT ASSERTING SOMETHING ONLY THE SERVER CAN KNOW.** A registry
+compiled into the bundle cannot tell you what is on the server's disk. Three guards now, because
+any one alone still leaves a silent blank frame:
+- **the page asks the server** — the `replicaFor`/`replicaBySlug` short-circuit is gone, and the
+  `undefined` "still checking" state it already modelled is what makes the extra hop invisible;
+- **lookup checks the file** before claiming a static hit (BOTH twins, BOTH branches), so the
+  registry fails CLOSED and falls through to the dynamic store;
+- **`/replicas/*` 404s** rather than reaching the SPA catch-all — registered BEFORE it, or it can
+  never run, which the audit pins separately from the route's existence.
+
+⚠ **A DEPLOY-ONLY BUG, AND THAT IS WHY IT SURVIVED EVERY LOCAL CHECK.** This machine has both
+captures, so the static path resolved and the page was correct here every single time. Reproduced
+by moving `public/replicas/aptive.html` aside: the page then framed the SPA shell exactly as
+production did, and after the fix served the real capture ("Build a Plan – Aptive Pest Control",
+1 form, 38 inputs). Restoring the file, the static path still works — both verified.
+⚠ **AND THE VITE CONFIG IS READ AT STARTUP**: the API fix looked like it had not worked until the
+dev server was restarted, which is this file's Node-cache caveat wearing a different hat.
+
+**`npm run audit:replicas` gained 5 checks** — both twins' branches, the 404 guard, its ORDER
+against the catch-all, and the page no longer reading the registry. Two were broken on purpose
+and seen to fire (moving the guard after the catch-all, restoring the short-circuit).
+
+#### The submit button WAS replicated — it was clipped out of its own frame (9/15/2026)
+Reported directly: *"you need to also make sure that the submission button is also always
+replicated, for example i dont see one for greenix"*, alongside *"if i hit submit, would you be
+able to see the values of these fields."*
+
+⚠⚠ **I HAD ALREADY MIS-REPORTED THIS ONCE, AND THE MISTAKE IS THE ONE THIS FILE KEEPS
+RECORDING.** I said the Greenix replica rendered "0 form fields in the DOM" — measured on the
+replica frame's document only. Walking one level further finds **1 form, 25 inputs and a real
+Submit** inside the HubSpot embed. `replicaDocs` had always handled that (its own header names
+greenixpc.com as the reason it exists); my probe did not. **When a probe says a page has nothing,
+walk further in before believing it** — the same shape as the record tiles, the nav bar and the
+`background-image` marks.
+
+**The real defect was geometry.** Measured on that replica: the HubSpot frame renders **402x498**
+while its own document is **600** tall, putting Submit at **527** — 29px past the bottom edge,
+with no scrollbar to reach it. A third-party embed is normally grown by its own script posting a
+height to the host page, and that script is precisely what a replica strips, so the frame stays
+frozen at whatever height it was captured with. The button was captured, neutralised, wired and
+working; it simply was not on screen.
+
+`fitEmbeddedFrames(doc)` grows every same-origin **form** frame to its content height, called on
+bind and again at 600ms once fonts and images have settled. Measured after: the frame is 600 and
+Submit sits **219px inside it**.
+⚠ **IT ONLY EVER GROWS** — shrinking would clip an embed deliberately taller than its document,
+and nothing here knows which is which. ⚠ **FORM FRAMES ONLY** — a chat widget or an ad iframe
+reports a tall document too, and stretching those pushes the real page apart for nothing.
+
+**So yes, a submit delivers the values — verified with a real click rather than asserted.** Filled
+the nested HubSpot form and pressed its own Submit: a lead was captured reading name
+"Dana Whitfield", contact "(602) 555-0147", `location: "Phoenix"` (ZIP 85018 resolved through
+`/api/zip`), `source: "web"` — and **"Aptive - SMS - Quote Request (Dana)" appeared in the Agent
+Studio table**, so the whole replicate → lead → workflow chain runs from a form inside a frame.
+⚠⚠ **A PROBE FAULT WORTH RECORDING, because it looked exactly like a bug in the field map.** The
+first submit stored `contact: "+1"`. HubSpot's phone widget is TWO inputs — a visible `type=tel`
+with **no name** (id `phone-8e0d2466…`, which is what the stored field map points at) and a
+HIDDEN `name="phone"` twin its script normally syncs. My fill targeted `input[name^=phone]` and
+hit the hidden one, so the read returned the visible field's placeholder `+1`. Typing into the
+field a human actually uses returns the number in full. **Fill what the map names, not what the
+name looks like.**
+
+⚠ **AND A WEB-FORM LEAD WAS LISTING UNDER AN LSA TRIGGER.** `triggeredBy` was pinned to
+"Google Local Services ad — quote request submitted", so a lead filled in on the prospect's own
+replicated booking page showed that in Agent Studio's **Triggered By** column — contradicting the
+page the SE had just submitted in front of the room. It reads `q.source`, the same flag the
+opener's channel phrase already uses, rather than a second one that can drift out of step.
+
+**`npm run audit:replicas` gained 6 checks**: the fit exists, only grows, is form-frames-only,
+runs twice, clears its timer, and the trigger line names the real source. Three were broken on
+purpose and seen to fire (letting it shrink, letting it stretch every iframe, restoring the
+hardcoded trigger).
+
+**Verified end to end against the real server, not by construction.** Saving wrote
+`customizations.overrides["/google-search"].bookingUrl` into `.data/demos/aptive.json` with
+`updatedAt` bumped; **deleting every local trace** (the store key and the legacy key), reloading,
+and reopening the demo from the Launch library brought the link back **from the record** and Book
+online rendered `/replica?url=…` again. Reset then wrote `bookingUrl: ""` through to that same
+file and the link returned to the tracked `oppref` default. The unit is unchanged at 652x341 with
+5 actions, exactly 1 a link — and Aptive is left **saved**, pointing at its replica.
+
+## Read.Me + the in-app docs
+- A **row in the launch menu** (`src/components/LaunchMenu.tsx`), not its own button — see the
+  hamburger section below. It was `ReadmeButton.tsx`, a fixed bottom-right pill styled
+  `.readme-fab`, until the corner stack was folded into one menu on 9/10/2026; that component
+  and its CSS are **deleted**, not merely unmounted.
+- **It renders ONLY on the launch form** (`MENU_ON` in `App.tsx`). Everything past that form
+  is a replica of Invoca's product shown to a prospect, and an internal-docs affordance on a
+  dashboard reads as ours rather than theirs. The launch form is the one screen that IS our
+  tool. It is an ALLOW-list, not a deny-list, so a new route defaults to not carrying it.
+- ⚠️ **NO OVERLAY-HIDE CSS RULES, AND THEY MUST NOT COME BACK.** `.aiad`, `.idr-root`,
+  `.sdr-root` and `.vp-root` all live inside the app shell, which the launch form is not part
+  of, so such selectors could never match. What DOES matter is the z-order: `.lm-root` is
+  z-1000, deliberately under `.fb-overlay` (1400), so the Support modal covers the hamburger
+  instead of competing with it (asserted by hit-testing the toggle's centre while the modal is
+  open — it returns `.fb-overlay`).
+  ❌ **A LATER BULLET IN THIS SECTION CLAIMED THE OPPOSITE and was stale for months** — it
+  described the button being hidden via `body:has(.aiad--open)` etc. Those rules were removed
+  long before this change; the bullet is deleted below rather than left to contradict this one.
 - **The docs ship with the app.** `public/readme.html` is copied into `dist/` by the build and
   served by `express.static`, so `/readme.html` works on Render, on `npm run serve`, and in
   dev. No external host, no claude.ai account needed. Opens in a new tab so an SE mid-demo
@@ -6976,11 +9909,6 @@ COLUMN, add/remove a TILE, add/remove a chart SERIES, pie SLICE or axis POINT.
 - `.mast` / `.tabs` sit **outside** `.wrap`, so they must not carry `.wrap`'s negative inset
   margins -- `margin: 0 -30px` there pushed 60px past the viewport and scrolled the whole page
   sideways. They're full-bleed already; padding alone gets the look.
-- Hidden (`opacity: 0; pointer-events: none`) whenever an overlay is open, keyed off the real
-  open-state selectors via **`body:has(...)`**: `.aiad--open` (Ask AI, z-3000) and the z-1200
-  full-viewport drawers `.idr-root` / `.sdr-root` / `.vp-root`. **Add new overlays here.**
-  It must be `body:has()`, not `.app:has()` -- the button is mounted above `.app`, so an
-  `.app`-scoped selector silently stops matching.
 - **Two different demo counts, both correct.** `/api/status.demos` is `listDemos().length`,
   the shared library on the server disk -- that is what the doc prints. The Launch picker's
   "My demos" adds locally-registered profiles that were never published, so it reads higher.
@@ -7140,6 +10068,238 @@ it holds the app in the Browser pane. Navigate within it via `preview_eval`
   NEW data-driven feature into `engine/core.ts` so new prospects get it. Pure design
   changes are shared CSS and apply to everyone.
 
+## A fourth Launch-screen dropdown: "2026 Dallas Invoca Summit" (9/9/2026)
+
+Asked for directly: *"Can you another drop down under Team Demos call '2026 Dallas Invoca
+Summit'."* — a new section between **Team Demos** and **Samples** on the Launch screen's demo
+library.
+
+⚠️ **DELIBERATELY UNWIRED — asked, and the user's own answer.** Offered three ways to
+populate it (tag specific existing demos now, add a per-row "move to Dallas Summit" action, or
+just the empty section with wiring as a follow-up); the user picked the third. So `EntryGroup`
+gained a fourth member, `"dallas"`, that nothing currently assigns — no demo carries it, and
+there is no UI action that would.
+
+⚠️⚠️ **EVERY OTHER SECTION HIDES ITSELF WHEN EMPTY, so adding the group alone would have
+rendered NOTHING.** `GROUP_ORDER.map` already dropped a section with zero rows
+(`if (!rows.length) return null`), which is right for My/Team/Samples — an empty "Samples"
+would be a rendering bug — and wrong for a placeholder whose whole point is to be visible
+before anything is tagged into it. `GROUP_ORDER` entries now carry an optional third element,
+`alwaysShow`, set only on this one; the skip becomes `if (!rows.length && !alwaysShow) return
+null`.
+
+⚠️ **THE EMPTY-STATE COPY NEEDED ITS OWN BRANCH TOO.** `LibraryPicker`'s dropdown showed
+`Nothing matches "{query}"` whenever the filtered list was empty — correct for a real miss, and
+misleading here: with no query typed it would have printed `Nothing matches ""`, blaming a
+search that never happened. Branches on `entries.length === 0` (no rows exist at all, not just
+none matching) to show **"No demos in this section yet."** instead.
+
+Verified live: the section renders at position 3 of 4 reading "2026 DALLAS INVOCA SUMMIT · 0",
+opens to the new empty-state copy, and Team Demos and Samples on either side of it are
+unaffected (Team Demos still opens and lists its one real row, Discount Tire).
+
+✅ **SUPERSEDED — the section is populated now.** This previously ended "NOTHING TAGS A DEMO
+INTO IT YET… that is its own follow-up". The follow-up arrived the same day; see the section
+directly below.
+
+## The 59-prospect Dallas Summit roster, and the EVENT store it needed (9/9/2026)
+
+Asked for with a spreadsheet attached (`Companies_-_2026_Dallas_Invoca_Summit_with_websites.xlsx`,
+59 rows of name + website): *"i want you to create all of these prospects, i have shared their
+name and URL, and i want you to only add them to the '2026 dallas Invoc Summit' drop down."*
+
+### ⚠️⚠️ NEITHER EXISTING STORE FITS A ROSTER, AND ONE OF THEM WOULD HAVE QUINTUPLED THE BUNDLE
+This is the decision the whole change rests on. There were two obvious homes and both are wrong:
+
+| store | why not |
+|---|---|
+| `src/data/generated/*.json` | loaded by an **EAGER `import.meta.glob`** and Zod-parsed at boot, so every file lands in the single JS bundle. Measured: profiles are **~155KB each**, so 59 of them is **~9MB on top of a 1.85MB bundle** — and the single bundle is load-bearing for the service worker. They would also all appear in the customer switcher and under "My demos", which is the opposite of the ask. |
+| `DATA_DIR/demos` | the RIGHT shape (fetched one at a time, shared by the team) but it is a **git-ignored disk**, so nothing generated locally ever reaches production. |
+
+So the profiles are committed under **`engine/event-seeds/`** — outside `src/`, where the glob
+cannot see them — and `engine/eventSeeds.ts` imports them into the library **at boot**, beside
+the dash sweep and the demo patches. They travel with a `git push` and cost the browser nothing
+until somebody opens one.
+⚠️ **EXISTING RECORDS ARE NEVER OVERWRITTEN, and "already in the store" is the guard rather than
+a marker file.** Both boot migrations use a marker; this must not, because a redeploy mid-
+conference would then clobber whatever an SE had just edited on a roster demo. Asserted by
+mutating a seeded demo and reimporting.
+⚠️ **Boot migrations run in `server.ts` ONLY** (the Vite dev server does not run them), which
+this file already records — so `npm run seed:events` exists to populate a local `.data` without
+booting the prod entry.
+
+### ⚠️⚠️ EVERY SEEDED ID IS PREFIXED `dallas-`, AND THE COLLISION IS REAL, NOT HYPOTHETICAL
+Two of the 59 — **AutoNation** and **Goosehead Insurance** — already exist as BUNDLED profiles
+under exactly the slug a clean name produces, and the shared library holds 200+ more demos whose
+ids nobody is checking against this list. An unprefixed collision **does not error**: the seeder
+finds the id taken and SKIPS it, so that prospect is silently absent from the conference roster,
+and a bundled profile sharing an id drops out of its own Launch section too. `dallasDemoId(slug)`
+in `src/data/eventDemos.ts` is the one definition. `audit:events` asserts the prefix is
+**load-bearing** — it fails if no roster slug clashes any more, so the prefix cannot come to look
+like dead ceremony and get dropped.
+
+### `DemoRecord.event` is what files a demo under its own dropdown
+Optional, so all 234 records already on the disk keep loading. `DemoSummary` is the record minus
+the heavy payload, so it reaches `/api/demos` for free. Launch groups on it:
+`d.event === DALLAS_EVENT ? "dallas" : mine ? "mine" : "team"` — an event demo is filed under its
+event **whoever owns it**, because the roster is the point, not whose copy it is.
+⚠️ **ONE DEFINITION OF THE KEY, `src/data/eventDemos.ts`** — the seeder WRITES it and Launch
+READS it, and two copies is how one side ends up reading a key nobody writes: the demo renders in
+**no section at all** and nothing errors. Same trap as `smsWorkflowScopePath`. The module carries
+no React import so `engine/` can use it (engine → src is the existing direction).
+⚠️ **PATCH preserves it** (it spreads the record), so an SE editing a roster demo keeps it in the
+roster. **A DUPLICATE deliberately does NOT** — `createDemo` never sets `event`, so a copy lands
+in "My demos", which is right: a duplicate is that SE's own working demo. Both asserted.
+⚠️ **The Dallas section KEEPS its "always show even when empty" flag** even now that it has rows.
+Its rows come from the SERVER, and with the library unreachable the app falls back to local
+profiles only — a conference roster that silently vanishes reads as the demos having been deleted
+rather than as an offline library.
+
+### The names are cleaned, and the spreadsheet name stays searchable
+The user's choice when offered verbatim vs cleaned. `prospect` is what every screen shows **and
+what the voice agent says out loud**, so "H. LEE MOFFITT CANCER CENTER AND RESEARCH INSTITUTE,
+INC." became **Moffitt Cancer Center** and 28 other rows lost an LLC/Inc./Corporation suffix or
+gained proper casing (`JPMC` → JPMorgan Chase, `Task Us` → TaskUs, `Health Markets` →
+HealthMarkets, `University of Texas Southwestern Medical Center` → UT Southwestern Medical
+Center).
+⚠️ **SINGLE-WORD BRAND CAPS ARE PRESERVED — DIRECTV, TRG, HCL, DECA, MB2, CHRISTUS.** The first
+version of the audit's ALL-CAPS check failed **DIRECTV**, i.e. reddened on correct data, which is
+how a check gets deleted as a nuisance. It requires MULTI-WORD all-caps now.
+⚠️ **`DemoRecord.listedAs` keeps the verbatim row searchable**, because the Launch filter is a
+substring match on the DISPLAYED name — so pasting "Acuity Eyecare Holdings, LLC" off the original
+list would have found nothing, the query being longer than "Acuity Eyecare". Read from the roster
+JSON by the seeder so the two cannot disagree, and **absent** where the name was not changed
+rather than duplicating the same string twice.
+⚠️ The roster (`scripts/dallas-roster.json`) is verified **row for row against the .xlsx** — all
+59 `listedAs` and all 59 URLs match column A and column B exactly, so the cleanup can be re-read
+against the source at any time.
+
+### Generating 59 of them: `npm run gen:events`
+⚠️ **RESUMABLE BY CONSTRUCTION, and that is not polish.** A prospect whose seed file already
+exists is skipped, so a run that dies at prospect 40 is restarted with the same command. The
+roster is a couple of hours of Opus; a rate limit or a dropped connection is a normal event over
+that window, not an exceptional one.
+⚠️ **A SHARED CURSOR, NOT FIXED-SIZE BATCHES.** A batch only finishes when its slowest member
+does, and research time swings with site size (this file already measures 60s vs 85s across two
+prospects), so batching spends a large fraction of the wall clock with idle slots.
+`--parallel N` × the engine's own 6-wide pool is the real concurrency — keep N low.
+⚠️ **`--limit` was used for a 3-prospect pilot before spending the rest**, on the user's own
+choice: the systemic risk here is the wiring, and finding it after 59 runs costs the whole roster.
+`--list` prints what is done and what is left.
+
+**`npm run audit:events` (also run by `npm run audit`)** — the roster half is 9 checks (count,
+unique slugs, valid ids, the prefix, complete rows, the prefix being load-bearing, no prefixed
+clash, multi-word caps, corporate suffixes); the seeder half RUNS the real `importEventSeeds`
+against a **throwaway `DATA_DIR`** (set before importing `demoStore`, which resolves it at module
+load) and reads the records back — event key present, `profile.id === id`, library metadata,
+an owner, `listedAs` agreeing with the roster, and a reimport adding nothing while an edited demo
+survives; then 10 wiring checks over comment-stripped source.
+⚠️ Each was broken on purpose and seen to fire: an ALL-CAPS name, a duplicate slug, removing the
+dallas grouping from Launch, and stubbing out `importEventSeeds()` in server.ts each turned one
+red, and all went green again on restore.
+
+### Result: 59 of 59, and the two defects the new prospects exposed
+**56 generated in 69.3 minutes at `--parallel 3`, 0 failures** (plus the 3-prospect pilot).
+Measured: ~190s per prospect against the canary's 151s solo, so 3-wide contention costs ~25%
+per run and still triples throughput. **4 API 500s, all on `qualityManagement`, all absorbed by
+`phase()`'s single retry** — verified afterwards that every one of the 59 carries a full 15-key
+`qualityManagement`, so nothing was silently thinned. All 59 Zod-parse, all 17 report slices
+present on every one, 59 unique names, and 58 of 59 derive a valid Signal AI Silver/Gold pair
+(Methodist Health System **fails closed** — no genuine keyword miss on its transcript, which is
+the honest documented outcome rather than an invented rail).
+
+⚠️⚠️ **THE 59 NEW PROSPECTS TURNED `audit:place` RED, AND BOTH CAUSES WERE REAL.** Worth
+recording because the roster acted as a much wider test of screens nobody had changed:
+
+**1. Seven prospects fell back to Santa Barbara** — the exact defect the 9/8 note is about,
+reappearing not as a regression but as the documented limit of substring matching. Every one
+named a real city that simply was not in `CITIES`: Katy, Tyler, Hershey, Nacogdoches, Asheville,
+Cerritos, Cornelia. Seven keys added, coordinates from **Places API (New)** `places:searchText`
+with a **state-qualified** query and every returned address checked — the bare-city ambiguity
+that put Washington in the wrong state and Duluth in Minnesota is what qualifying avoids.
+⚠️ The legacy `maps/api/place/textsearch` endpoint is **REQUEST_DENIED — "You're calling a legacy
+API"** on this project's key; only Places (New) is enabled, which is what `engine/places.ts`
+already uses. Same class of trap as the Geocoding API note.
+
+**2. `offerHook`'s free-booking rule was only on the `offer` branch, and a CAMPAIGN THEME walked
+past it.** Rentokil generated a campaign literally named **"Free Site Survey"** while its
+`bookingTerm` **is** "Site Survey", so the ad headline promised a free booking — precisely the
+claim the other branch refuses. The rule is about what the ad ASSERTS, so it cannot depend on
+which field the words came from; `promisesFreeBooking()` now gates both. Verified to fire:
+removing it reddens Rentokil again.
+
+⚠️ **AND ONE OF THE TWO FAILURES WAS THE CHECK, NOT THE DATA — the eighth probe fault in this
+file.** `audit:place`'s relevance test reported Acuity Eyecare's "Comprehensive Eye Exams &
+Medical Eye Care" as *unrelated* to "eye exam near me": `sig()` keeps words of 4+ letters, so
+"eye" is dropped, and "exams" is not "exam". Both sides are singularised now, and it still
+catches what it was written for — ungating the hero product reddens Roto-Rooter, American Home
+Shield, Christian Brothers Automotive and Daikin, so stemming did not neuter it.
+⚠️ A NINTH probe fault in the same pass: a one-off sweep of the 59 called `tierView(...).rows`,
+but `TierView` carries **`signals`**, and the resulting "Cannot read properties of undefined"
+across all 59 read exactly like a broken generation.
+
+⚠️ **THOSE OTHER SUITES ONLY SCAN `src/data/generated` (15 profiles), so the roster is NOT
+covered by them** — `audit:leads`, `calllog`, `leaddetail`, `clrecord` and `tiers` all report
+"all 15 profiles ok" with 59 new profiles on disk. `audit:place` and `audit:events` are the two
+that see the roster. Widening the rest is its own pass; the roster was instead checked directly
+(Zod, every slice, `qualityManagement` depth, the tier pairs, lead counts).
+
+⚠️ **THREE ROSTER NAMES ALSO EXIST ELSEWHERE, and all three are correct rather than duplicates.**
+`Valet Living` is a second, distinct library record (`dallas-valet-living` beside the pre-existing
+`valet-living`), and `AutoNation` / `Goosehead Insurance` sit alongside their BUNDLED profiles —
+which is what the id prefix guarantees, and it was verified by id rather than by name. ⚠️ A
+name-based leakage probe reported all three as "leaked into My demos" and was wrong; the section
+counts (My demos unchanged at 22 while Dallas went to 59) are what settled it.
+⚠️ **`AT&T Business` and `AT&T` are two rows in the source list with different URLs**, so they are
+deliberately two demos. The ampersand survives to the screen (verified: no `&amp;`).
+
+## The SMS thread header shows a toll-free number, not the prospect's name (9/8/2026)
+
+Asked for directly, against the selected `.sms-namepill` element reading "Orlando Health":
+*"For all prospects i want you to change the contact information from the name of the
+prospect to a random 1-800 number."*
+
+⚠️ **A REAL IPHONE MESSAGES THREAD ONLY SHOWS A NAME WHEN THE SENDER IS A SAVED CONTACT.**
+This is a cold business number texting in, so the mockup was overstating the relationship
+even before the ask — digits are the more faithful render, not just what was requested.
+
+`tollFreeNumber(profileId)` lives in its own file, **`src/data/smsContactNumber.ts`**, for
+the same reason `workflowChrome.ts` and `workflowRows.ts` are their own files: `PhonePreview.tsx`
+imports `useProfile`, which reaches `profiles.ts` and its Vite-only `import.meta.glob`, so
+node cannot import that screen and a function stranded inside it could only be grepped, never
+called and swept for real collisions across every profile.
+
+⚠️ **DETERMINISTIC, HASHED OFF THE PROFILE ID — NOT `Math.random()`.** This file's own
+`newConvBase()` a few lines above is allowed to randomize a `callerId`, because that is a
+fresh CONSUMER phoning in on every new conversation. This is the BUSINESS'S OWN number, which
+has to be the same every time this prospect's preview opens, or an SE rehearsing the same demo
+twice sees a different "800 number" reach out — the same drift this repo already refuses for
+the SMS agent's opening line. Verified live: Orlando Health renders `(800) 555-0959` and Shady
+Blinds `(800) 555-0673`, both stable across a reload and a page navigation.
+
+⚠️⚠️ **THE FIRST EXCHANGE CHOICE COLLIDED, AND A WIDER ONE WAS ALREADY SITTING IN THIS
+REPO'S OWN DATA.** The obvious reserved-for-fiction block is 555-0100 through 555-0199 (100
+values), and it collided twice over the 17 real profiles on disk. But this repo's own
+generated phone numbers already use the WIDER shape — `555-0184`, `555-0847`, `555-0641`,
+`555-0142` all appear elsewhere in this file's own history — i.e. exchange 555 followed by
+`0` and three digits, 1,000 values. Switching to that shape gives **zero collisions across
+all 23 profiles** (bundled and library), where the narrower block already had two.
+
+**`npm run audit:ai` gained 7 checks**: at least ten real profiles get swept, every number
+matches `(800) 555-0XXX`, all are distinct, the number is a pure function of the id, at least
+one real id proves the wider 1,000-value range is actually in effect (not just the narrower
+555-01XX block), the contact pill calls `tollFreeNumber(profile.id)`, and the old
+`profile.customerName` render is gone rather than merely shadowed. Each verified to fire:
+narrowing back to 100 values produced a real collision across the 23 profiles, breaking the
+format, making the number non-deterministic, and reverting the render call each turned one
+red.
+
+Verified in the browser on two prospects: Orlando Health's Preview Agent renders
+`(800) 555-0959` and Shady Blinds' renders `(800) 555-0673`, both matching the values computed
+directly from `hash(profileId) % 1000`, both surviving a `location.reload()`. `audit:voice`
+(107), `audit:place` and `audit:phases` green, typecheck clean, `audit:seeds` unchanged at the
+same pre-existing 14 of 34.
+
 ## No human-agent QA signals on the AI conversation reports (9/3/2026)
 
 Asked for pointing at "(QA) Proper Greeting" / "(QA) Proper Close" in the AI SMS report's MET
@@ -7263,6 +10423,98 @@ either fence, breaking one twin's buffering header, and letting a dropped stream
 ⚠️ That last one matters most: a stream that ends with neither `done` nor `error` must throw,
 or the drawer reports success having changed nothing — the silent no-op this file has now
 recorded five times.
+
+### The voice Preview Workflow drawer has its own Ask AI + undo, on the LEFT (9/16/2026)
+Asked for directly, pointing at the SMS chat drawer's pair: *"just like how the SMS Agent preview
+workflow has a Ask AI and undo button in the preview workflow, do it for the Voice Agent preview
+workflow as well."*
+⚠️ **THE SIDE WAS CORRECTED ON THE SPOT.** It was first asked for "from the right" and built that
+way, then immediately corrected to *"the drawer should come on the left side of the screen"* —
+which is also what the existing `.aiad--left` note argues for, and the reason is the same one it
+records: the thing being configured sits on the right, so a right-hand panel lands on top of it
+and its backdrop dims and blocks it.
+
+The SMS chat has carried a sparkle and an undo in its header since 8/26. The voice Preview
+Workflow drawer had neither, so the only way to change what the voice agent says was the top-bar
+sparkle on the page BEHIND the drawer — reachable only by closing the thing you were looking at.
+
+⚠️⚠️ **IT TARGETS THIS PAGE'S OWN SCOPE, AND THAT IS THE ONE REAL DIFFERENCE FROM THE SMS PAIR.**
+`WorkflowChatPreview` has to carry a scope key, `registerBase` it, and keep its own undo stack,
+because the SMS agent's config lives on ANOTHER page (Preview Agent) and is shared by both
+previews. On a voice workflow there is no such split: `baseAgent` is merged into the very object
+the diagram is registered with, precisely so one instruction can reshape the tree and configure
+the agent together (see the 8/27 section above). So this pair registers nothing and synthesises
+nothing — `pageKey` is `${profileId}::${pathname}`, the same string `usePageData` builds, and the
+buttons are a second door onto the scope the top-bar sparkle already edits, opened from where the
+SE is actually standing. A pair that grew its own key would be editing a scope nothing renders,
+which is the silent no-op this file records six times.
+⚠️ **UNDO THEREFORE SHARES THE PAGE'S STACK, which is correct rather than a compromise.** One
+scope has one history, and a voice instruction lands on the tree AND the agent at once — two
+stacks could undo half of one instruction. Verified: the drawer's undo cleared `agent.greeting`
+and all five rules in a single step and went back to "Nothing to undo".
+
+⚠️ **`side: "left"` HAS TO BE PASSED, because the platform default is the right.** Omitting it is
+not a neutral choice — `AssistantFocus.side` is `"left"`-only and everything else in the app wants
+the right-hand panel with its backdrop — so the audit asserts the left POSITIVELY rather than by
+the absence of anything. On the left there is no backdrop, `pointer-events` sit only on the panel,
+and the voice drawer beside it stays lit and clickable, including mid-call.
+
+⚠️⚠️ **THE LEFT PANEL RESERVED 412px FOR A 400px CHAT, AND THE VOICE DRAWER IS 500px — so below
+about 920px it covered the very thing it had been moved left to keep visible.** Measured before
+the fix: 0 overlap at 1092 and 1024, **20px at 900** and **88px at 800**. `body:has(.vp-root)
+.aiad--left .aiad-panel` reserves 512 instead, which is 0 overlap at all four widths (at 800 the
+panel sits on its own 300px floor and the drawer starts at exactly 300; at 900 there are 12px of
+clearance).
+⚠️ **KEYED ON THE VOICE DRAWER BEING ON SCREEN, NOT ON WIDENING THE RESERVE FOR EVERYONE.** A
+global 512 would have changed the SMS chat's panel at every width under ~924 — a screen that is
+signed off. Verified on the SMS page at exactly 900px, the width where the two rules diverge:
+`.vp-root` absent, panel still 420, chat at 500, overlap 0. `:has()` is already used in this app
+for `HiddenTileStyles`, and it works here regardless of where the two drawers sit relative to each
+other in the DOM, which a sibling selector would not.
+
+⚠️ **GATED ON THE REGISTERED DATA'S SHAPE, NOT THE PATHNAME** — the same signal `pageHint` keys
+its empty state off. A CREATED workflow deliberately registers no `agent` half, so a sparkle there
+would offer to change what an agent says on a page whose whole state is that nothing is
+configured, inside a preview that is the minimal greet-classify-hand-off flow. Verified on a real
+created Voice workflow: its drawer header has ONLY the close button and zero sparkles.
+
+⚠️ **ITS OWN `.vp-icon-*` PREFIX, not the chat's `.wcp-icon-*`.** Every value is identical today,
+which is exactly what makes sharing tempting; one prefix per screen is what stops a value changed
+for one drawer restyling the other, and this repo has already paid for that once (79 `.cd-` rules
+deleted as collateral by a component rebuild). The blast radius was measured rather than assumed:
+rule counts per prefix across `app.css` show `vp` 16 -> 28 and **every other prefix unchanged**.
+⚠️ `.vp-title` gained `flex: 1`, because `.vp-head` is `justify-content: space-between` and
+without it four children spread themselves across the header instead of grouping the icons at the
+right.
+⚠️ **HIDDEN UNTIL THE HEADER IS HOVERED**, like the chat's: close is part of the captured drawer
+and these two are ours, so at rest the replica still reads as the capture.
+
+**`npm run audit:ai` gained 18 checks** (the pair renders, it targets the page's own key, that key
+still matches what `usePageData` builds, it opens an agent focus, it passes `side: "left"`, `left`
+is still the opt-in the focus offers, a left drawer still lets the preview take clicks, the 512px
+reserve exists and is keyed on the voice drawer, the chat's 412px is untouched, the SMS chat still
+opens left, the gate exists AND wraps the buttons, undo respects `readOnly`, no `.wcp-` borrowing,
+and the four CSS rules).
+⚠️ Six were broken on purpose and each fired: dropping `side`, ungating the pair, giving it a
+bespoke key, making it always visible, putting the reserve back to 412, and un-keying the rule.
+⚠️ **ONE CHECK WAS WRONG FIRST AND FAILED ON CORRECT CODE — the thirteenth probe fault in this
+file.** It tried to match `calc(100vw - 412px)` from the `.aiad--left .aiad-panel` selector
+onwards within a 400-character window, and that rule's own explanatory comment is longer than
+that. `412px` appears nowhere else in the stylesheet, so counting its occurrences is the honest
+test.
+
+**Verified in the browser with real hovers and clicks**, not by construction: at rest both are
+opacity 0 and only close is visible; hovering the header brings them to 1 and 0.35 (disabled undo)
+in `#2666f9` and `#15243e`, matching the chat's pair exactly; the sparkle opens
+`aiad aiad--open aiad--left` with **no backdrop**, the panel flush to the LEFT edge at 420px with
+the root's `pointer-events: none` and the panel's `auto`, sub-heading "Aptive voice agent" and the
+empty state "Build Aptive's voice agent". One instruction ("open with … and add a rule that it
+never quotes a price") **landed in the store** — `agent.greeting` set and `agent.rules` at 5 under
+`aptive::/agent-studio/agent/workflow/voice`, undo depth 1 — and the drawer's own undo took it
+back to nothing. Untouched and checked afterwards: the SMS chat's sparkle still opens LEFT at x=0
+with no backdrop and its panel still 420 at 900px, the voice diagram is still 12 nodes / 15 chips,
+the SMS diagram 6 / 2 with its minimap, and `/dashboards/marketing` is 17 cards / 5 donuts / KPI
+64,004 with **zero `.vp-` elements**.
 
 ## The search location is one the business actually has, and an SE can set it by ZIP (9/8/2026)
 
@@ -7495,7 +10747,33 @@ a standby cannot see production's 219 demos. Failover needs the store moved off 
 `engine/demoStore.ts` — the same migration this file already names as the real fix for
 zero-downtime deploys. It needs a store provisioned, which is the user's to do.
 
-## ⚠️ OPEN ITEMS as of 9/3/2026 (found this session, NOT yet fixed)
+## ⚠️ OPEN ITEMS as of 9/9/2026
+
+**0. THE STAGING SERVICE IS STILL MID-CREATION; `main` HAS SINCE MOVED PAST IT AND IS NOW TWO
+COMMITS UNPUSHED.** ⚠️ **The paragraph this replaces is STALE — corrected here rather than
+left to mislead:** it said "production is still on `68c602c`". Production has since been
+pushed to and is now on **`3cc7ef0`** (the workflow-tree symmetry fix), confirmed live via
+`/api/status`. Current split:
+- `origin/main` = `3cc7ef0`. Local `main` is **two commits ahead, unpushed**:
+  `a0651d1` (the SMS thread header's toll-free number) and `c847814` (the "2026 Dallas Invoca
+  Summit" Launch dropdown). Neither is destructive or environment-sensitive; both are waiting
+  only because nobody has said "push it" for them yet.
+- `origin/staging` is still at **9628972** and has not moved since 9/8. It has not caught up
+  to `main` at all — everything from 9/8 onward (the ER workflows, the tree symmetry fix, the
+  toll-free number, the Dallas dropdown) is on `main`/production but NOT on `staging`.
+- ⚠️ **`staging` IS A DEPLOY POINTER, NOT A BRANCH TO DEVELOP ON.** Keep working on `main`
+  locally; `git push origin HEAD:staging` deploys, `git push origin main` promotes. Do not
+  `git checkout staging`.
+- The Render Web Service itself was still being filled in as of 9/8 and its state has not been
+  checked since. Every field value, the four autofills to correct, and the env vars to set and
+  omit are in **`docs/ENVIRONMENTS.md`** — read that before touching the dashboard.
+- ⚠️ **AN OPEN DECISION, STILL UNRESOLVED:** the user said they are **not** adding Google auth
+  to staging. That leaves every `/api/*` route reachable by anyone with the URL, and the
+  exposure is COST (our Anthropic, LiveKit and Places keys) rather than prospect data. The
+  runbook gives the two safe shapes — omit `ANTHROPIC_API_KEY` too (14 bundled prospects still
+  render in full), or add the two Google vars. **Do not assume either.**
+
+## ⚠️ OPEN ITEMS carried from 9/3/2026 (NOT yet fixed)
 
 **1. ⚠️⚠️ AN ENDED CALL LEAVES THE AGENT IN THE ROOM, AND IT BILLS.** Measured live, twice.
 Navigating away from the call drops the CALLER (`hangUp` -> `destroyLive`) and the room goes
@@ -7552,8 +10830,10 @@ agent — `isBooked` requires `booked === true` plus a day and a time, so neithe
 lead. ⚠️ **The lesson: for anything gated on a captured call, "is it live?" is answered by
 checking the record AND the browser's captures, never by the commit alone.**
 
-**4. `src/data/generated/denver-health.json` is untracked and was not created by this work.**
-Left alone deliberately; decide whether it belongs in git.
+**4. ✅ RESOLVED — `src/data/generated/denver-health.json` is now tracked in git.** This item
+previously said it was untracked; checked 9/9/2026 and `git ls-files` confirms it is in the
+repo. Whoever decided it belonged in git did so at some point between then and now; nothing
+left to do.
 
 ## Deferred polish (TODO)
 0. **ZERO-DOWNTIME DEPLOYS — route B built 2026-08-20, ONE CHECK OUTSTANDING.**
@@ -7707,6 +10987,14 @@ Left alone deliberately; decide whether it belongs in git.
 - Fully offline exact-copy pages (localize GT America + logo assets) if needed.
 
 ## Gotchas
+- ⚠️ **A STALE `nohup npm run dev` HOLDS PORT 5173 FOR DAYS, and killing it needs the
+  LISTENER, not every socket on the port.** Hit twice on 9/8/2026 (one process was 4d17h
+  old, another 7h28m). `lsof -ti tcp:5173` also lists a **Google Chrome network-service
+  helper** that merely has a connection open, so `kill $(lsof -ti tcp:5173)` takes out a
+  Chrome subprocess along with the server. Filter for the listener:
+  `lsof -nP -iTCP:5173 -sTCP:LISTEN -t`. Prefer `preview_start` over `nohup` so the server is
+  managed and does not outlive the work.
+
 - **Structured-output "grammar too large"**: generating the full profile in one structured
   call fails. The engine splits into separate calls (report, then dashboard). Keep any new
   screen's generation as its own call.

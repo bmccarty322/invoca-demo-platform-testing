@@ -73,6 +73,25 @@ export interface VoiceAgentSpec {
   /** The Inform & Route steps, verbatim, in the SE's own numbering. */
   informSteps: string[];
   /**
+   * What the agent does when a caller needs the support team.
+   *
+   * ⚠️ IT WAS A LITERAL INSIDE `workflowDrawers.ts` UNTIL 9/21/2026, which meant the drawer
+   * showed an instruction the PROMPT never carried — the drawer-describes-something-the-agent-
+   * does-not shape this file records three times. Optional, defaulting to the same wording, so
+   * an agent nobody has edited reads exactly as before.
+   */
+  escalateHandling?: string;
+  /**
+   * The SUPPORT intent's own description and conversation rules.
+   *
+   * ⚠️ BOTH WERE HARDCODED UNTIL 9/21/2026 — the description was a literal in
+   * `workflowDrawers.ts` and the rules were a bare `[]` — so the Need Support drawer showed
+   * five read-only boxes on the one page where the words ARE the prompt. Optional, and both
+   * fall back to exactly what was hardcoded, so an untouched agent is byte-identical.
+   */
+  supportIntent?: string;
+  supportRules?: string[];
+  /**
    * Which voice the agent speaks with — a `VOICE_OPTIONS` id like "thalia".
    *
    * ⚠️ **NOT PART OF THE PROMPT, and that is why it lives here rather than in `ChatBrain`.**
@@ -278,9 +297,28 @@ export interface VoiceAgentConfig {
   serviceZips?: string[];
   outOfAreaScript?: string;
   informSteps: string[];
+  /**
+   * What the agent does when a caller needs the support team.
+   *
+   * ⚠️ IT WAS A LITERAL IN `workflowDrawers.ts` UNTIL 9/21/2026 — so the drawer showed the
+   * agent an instruction nobody had actually told it. Giving it a home both fixes that and
+   * makes the field editable without becoming a dead control. Optional, and it falls back to
+   * the same wording, so an agent nobody has edited is byte-identical.
+   */
+  escalateHandling?: string;
+  supportIntent?: string;
+  supportRules?: string[];
 }
 
 /** The editable slice of a spec, for registering as page data. */
+/** The wording the escalate leaf has always shown. ONE definition, read by the drawer and the
+ *  prompt, so the two cannot drift. */
+/** The Need Support intent's description — ONE definition, read by the drawer and the prompt. */
+export const DEFAULT_SUPPORT_INTENT =
+  "Contacts seeking help with an existing product or service, such as troubleshooting, billing questions, or account changes.";
+export const DEFAULT_ESCALATE_HANDLING =
+  "Do not attempt to resolve the caller's question. Immediately let the caller know you're connecting them with a member of the support team, then transfer the call.";
+
 export function agentConfigOf(spec: VoiceAgentSpec): VoiceAgentConfig {
   return {
     greeting: spec.greeting,
@@ -294,6 +332,9 @@ export function agentConfigOf(spec: VoiceAgentSpec): VoiceAgentConfig {
     ...(spec.serviceZips?.length ? { serviceZips: spec.serviceZips } : {}),
     ...(spec.outOfAreaScript ? { outOfAreaScript: spec.outOfAreaScript } : {}),
     informSteps: spec.informSteps,
+    escalateHandling: spec.escalateHandling ?? DEFAULT_ESCALATE_HANDLING,
+    supportIntent: spec.supportIntent ?? DEFAULT_SUPPORT_INTENT,
+    supportRules: spec.supportRules ?? [],
     /* Omitted when unset, for the same reason as the two above: a key present with an
        undefined value serialises to the model as `null`, which reads as "this prospect has
        no voice" rather than "it has not chosen one". */
@@ -390,6 +431,18 @@ export function specWithConfig(spec: VoiceAgentSpec, cfg: VoiceAgentConfig | und
     outOfAreaScript: typeof cfg.outOfAreaScript === "string" && cfg.outOfAreaScript.trim()
       ? cfg.outOfAreaScript : spec.outOfAreaScript,
     informSteps: toSteps(cfg.informSteps, spec.informSteps ?? []),
+    /* A non-empty string only; an emptied field falls back rather than leaving the agent with
+       no escalation instruction at all — the same rule `toSteps` follows for the steps. */
+    escalateHandling: (typeof cfg.escalateHandling === "string" && cfg.escalateHandling.trim())
+      ? cfg.escalateHandling : (spec.escalateHandling ?? DEFAULT_ESCALATE_HANDLING),
+    supportIntent: (typeof cfg.supportIntent === "string" && cfg.supportIntent.trim())
+      ? cfg.supportIntent : (spec.supportIntent ?? DEFAULT_SUPPORT_INTENT),
+    /* ⚠️ AN EMPTIED RULE LIST IS A REAL STATE HERE, unlike the strings above: the support
+       intent ships with none, so "remove them all" has to mean none rather than falling back
+       to a default the SE just cleared. */
+    supportRules: Array.isArray(cfg.supportRules)
+      ? cfg.supportRules.filter((r) => typeof r === "string" && r.trim())
+      : spec.supportRules,
     /* ⚠️ VALIDATED, NOT TRUSTED. This object is the workflow page's Ask AI scope, so the
        model can write `agent.voice` — and an invented id would reach the worker and produce
        a call that connects and never speaks. An unknown value falls back to the spec's own,

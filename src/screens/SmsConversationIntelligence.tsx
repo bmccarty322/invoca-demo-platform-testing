@@ -4,9 +4,10 @@ import { useProfile } from "../data/ProfileContext";
 import { useSmsCapture } from "../data/SmsCaptureContext";
 import { Pill } from "../components/Pill";
 import { AgentStudioIcon } from "../components/nav";
-import type { SmsConversation, SmsInfo } from "../data/schema";
+import type { CustomerProfile, SmsConversation, SmsInfo } from "../data/schema";
 import { withoutAgentQaSignals } from "../data/aiSignals";
 import { usePageData, DashAssistant } from "../components/GeneratedTiles";
+import { smsInfoAttribution } from "../data/salesforceLeadDetail";
 
 /* The AI Agent glyph in the transcript/legend = the Invoca AI icon (same SVG as
    the sidebar Agent Studio icon), tinted Invoca purple (#855ede) — matches live. */
@@ -30,7 +31,23 @@ function InfoField({ label, value }: { label: string; value?: string }) {
     </div>
   );
 }
-function SmsInfoPanel({ info }: { info: SmsInfo }) {
+/* ⚠️⚠️ MARKETING DATA NOW CARRIES THE SAME ELEVEN ATTRIBUTION FIELDS THE SALESFORCE
+   LEAD RECORD SHOWS, asked for directly: "add all the marketing data for this SMS
+   Info, like all the data that you have added to the salesforce lead." Derived, not
+   generated — `smsInfoAttribution` (src/data/salesforceLeadDetail.ts) reuses the
+   EXACT same line-of-business/product-category/promotion/digitalInsights-row logic
+   the Lead page already uses, so the two screens cannot disagree. When this SMS's
+   own caller IS the SMS screen-pop's caller (the seeded example usually is), it is
+   literally that person's own Lead attribution, not a second independently-derived
+   copy of it. See that file's header for why. */
+function SmsInfoPanel({ info, profile }: { info: SmsInfo; profile: CustomerProfile }) {
+  /* ⚠️ THE FULL NAME, NOT `displayName` — the model writes those independently
+     ("J Harper" vs. firstName "Jessica" + lastName "Harper"), so matching on
+     displayName against `smsScreenpop.callerName` ("Jessica Harper") never hit,
+     and the identity-match branch below silently never fired. Caught by reading
+     the rendered page against the caller's own Lead record, not by a type. */
+  const callerFullName = `${info.firstName ?? ""} ${info.lastName ?? ""}`.trim();
+  const attribution = smsInfoAttribution(profile, callerFullName);
   return (
     <div className="sci-info-grid">
       <section className="sci-info-card">
@@ -70,6 +87,17 @@ function SmsInfoPanel({ info }: { info: SmsInfo }) {
         <div className="sci-fields">
           <InfoField label="DESTINATION TIME ZONE" value={info.destinationTimeZone} />
           <InfoField label="SMS SESSION STATUS" value={info.sessionStatus} />
+          <InfoField label="LINE OF BUSINESS" value={attribution.lineOfBusiness} />
+          <InfoField label="PRODUCT OF INTEREST" value={attribution.productOfInterest} />
+          <InfoField label="PRODUCT CATEGORY" value={attribution.productCategory} />
+          <InfoField label="PRODUCT NAME" value={attribution.productName} />
+          <InfoField label="PRODUCT PROMOTION" value={attribution.productPromotion} />
+          <InfoField label="MARKETING SOURCE" value={attribution.marketingSource} />
+          <InfoField label="MARKETING MEDIUM" value={attribution.marketingMedium} />
+          <InfoField label="MARKETING CAMPAIGN" value={attribution.marketingCampaign} />
+          <InfoField label="MARKETING SEARCH TERMS" value={attribution.marketingSearchTerms} />
+          <InfoField label="WEBSITE JOURNEY" value={attribution.websiteJourney} />
+          <InfoField label="WEBSITE CALLING PAGE" value={attribution.websiteCallingPage} />
         </div>
       </section>
       <section className="sci-info-card">
@@ -83,15 +111,36 @@ function SmsInfoPanel({ info }: { info: SmsInfo }) {
   );
 }
 
-export function SmsConversationIntelligence() {
+/**
+ * @param only  Opt-in. `"lsa"` renders ONLY quote-request threads (the
+ *              "AI SMS Conversation Intelligence (LSA)" report); omitted renders the general
+ *              report, which now EXCLUDES them.
+ *
+ * ⚠️⚠️ **THE TWO REPORTS ARE EXCLUSIVE, AND THAT IS A DECISION.** Asked for directly: *"push
+ * the conversation into reports as well, call it AI SMS Conversation Intelligence (LSA)."*
+ * Listing a thread in BOTH reports would read as a duplicate rather than as two views, and the
+ * general report would keep drifting as an SE rehearses the LSA beat. So a quote-request thread
+ * files itself under (LSA) and leaves the general report exactly as it was before the LSA work
+ * existed.
+ *
+ * ⚠️ **ONE COMPONENT, AN OPT-IN PROP — not a second screen.** Both reports are the same
+ * three-column report down to the tabs; a copy would drift on the first fix. Same pattern
+ * `ConversationIntelligence`'s `tier` prop uses, and `only` defaults to undefined so the
+ * existing route is untouched.
+ */
+export function SmsConversationIntelligence({ only }: { only?: "lsa" } = {}) {
   const { profile } = useProfile();
   const { capturedFor } = useSmsCapture();
   /* Registers this page as the AI scope and returns the slice with any
      edits made ON THIS PAGE overlaid (see usePageData). */
   const view = usePageData(profile.reports.smsConversationIntelligence);
 
-  const captured = capturedFor(profile.id);
-  const seed = view?.conversations ?? [];
+  const all = capturedFor(profile.id);
+  /* ⚠️ THE SEED IS DROPPED ON THE (LSA) REPORT, and it has to be: those examples are generated
+     general SMS threads, so listing them under a report whose whole claim is "these came from a
+     quote request" would put three threads there that no form ever produced. */
+  const captured = only === "lsa" ? all.filter((c) => c.lsa) : all.filter((c) => !c.lsa);
+  const seed = only === "lsa" ? [] : (view?.conversations ?? []);
   // Captured conversations accumulate at the top (newest first); seed examples
   // fill in below. The list scrolls, so no hard cap.
   /* ⚠️ `withoutAgentQaSignals` strips "(QA) …" signals: no human agent answered these,
@@ -104,11 +153,20 @@ export function SmsConversationIntelligence() {
 
   const selected = conversations.find((c) => c.id === selectedId) ?? firstActive;
 
-  if (!view && captured.length === 0) {
+  if ((only === "lsa" || !view) && captured.length === 0) {
     return (
       <div className="report-surface">
-        <div className="placeholder"><h2>No SMS conversations</h2>
-          <p className="muted">This report isn't set up for {profile.customerName} yet.</p></div>
+        <div className="placeholder">
+          <h2>{only === "lsa" ? "No quote-request conversations" : "No SMS conversations"}</h2>
+          {/* ⚠️ The (LSA) row only lists once a thread exists, so this is the typed-the-URL
+              case. Naming the actual precondition beats "isn't set up yet", which would read
+              as the report being broken rather than as the beat not having been run. */}
+          <p className="muted">
+            {only === "lsa"
+              ? "Submit a quote request from the Google Local Services ad, then reply to it in Preview Agent and the conversation lands here."
+              : `This report isn't set up for ${profile.customerName} yet.`}
+          </p>
+        </div>
       </div>
     );
   }
@@ -240,7 +298,7 @@ export function SmsConversationIntelligence() {
                 )}
               </>
             )}
-            {tab === "info" && (selected?.smsInfo ? <SmsInfoPanel info={selected.smsInfo} /> : <div className="sci-empty">No SMS info available.</div>)}
+            {tab === "info" && (selected?.smsInfo ? <SmsInfoPanel info={selected.smsInfo} profile={profile} /> : <div className="sci-empty">No SMS info available.</div>)}
             {tab === "comments" && <div className="sci-empty">No comments on this conversation.</div>}
           </div>
         </aside>

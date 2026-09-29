@@ -35,13 +35,18 @@ import { livekitEnv, mintVoiceToken } from "./engine/livekitToken.ts";
 import { askAssistant } from "./engine/assistant.ts";
 import { installAuth, authEnabled, currentUser } from "./googleAuth.ts";
 import { handleDemoApi, isAdmin } from "./engine/demoApi.ts";
+import { handleShareApi, shareReqFrom } from "./engine/share.ts";
+import { realShareDeps } from "./engine/shareDeps.ts";
 import { handleFeedbackApi } from "./engine/feedbackApi.ts";
 import { mailConfigured } from "./engine/mailer.ts";
 import { DATA_DIR, isPersistent } from "./engine/demoStore.ts";
+import { alert, alertSummary, type AlertLevel } from "./engine/alerts.ts";
 import { deployStatus } from "./engine/status.ts";
+import { renderConfigured } from "./engine/renderService.ts";
 import { runCanary, recordRun, toPublic as canaryPublic, BUDGET_SECONDS } from "./engine/canary.ts";
 import { migrateDemoDashes } from "./engine/dashSweep.ts";
 import { applyDemoPatches } from "./engine/demoPatches.ts";
+import { importEventSeeds } from "./engine/eventSeeds.ts";
 
 const ROOT = path.dirname(fileURLToPath(import.meta.url));
 const DIST = path.join(ROOT, "dist");
@@ -49,6 +54,42 @@ const OUT_DIR = path.join(ROOT, "src/data/generated");
 const PORT = Number(process.env.PORT) || 3000;
 
 const apiKey = process.env.ANTHROPIC_API_KEY;
+
+/* ---- ONE WAY FOR A ROUTE TO FAIL (9/16/2026) --------------------------------
+   Every handler below used to end in a bare `console.error` and a JSON error. The
+   destination existed once `engine/alerts.ts` landed and **none of them called it** —
+   18 log lines, 5 alerts, and the ones that mattered were in the 13. They catch and
+   respond, so they never reach the Express error handler either.
+
+   ⚠️ **A HELPER RATHER THAN 13 PAIRED CALLS, deliberately.** Two statements that must
+   always appear together will eventually appear apart, and the failure is invisible:
+   the endpoint still answers, the log still has a line, and nobody is told. One
+   function cannot log without alerting, and `audit:alerts` asserts no route handler
+   keeps a bare `console.error`.
+
+   ⚠️⚠️ **TRANSIENT THIRD-PARTY DEGRADATION IS `record`, NOT `page`.** An overloaded
+   Anthropic (529) is expected, self-correcting, and already surfaced to the user as
+   "briefly overloaded, please resend" — paging on it is exactly the noise that gets a
+   channel muted. Same for a replicate failure, which is usually the TARGET site
+   blocking a datacenter IP rather than anything of ours being broken. Those are
+   counted and visible on `/api/status`; they do not interrupt anybody. */
+function routeFailed(key: string, e: unknown, opts?: {
+  title?: string; level?: AlertLevel;
+  context?: Record<string, string | number | boolean | null | undefined>;
+}): void {
+  const err = e as any;
+  console.error(`[${key}] ${opts?.title ?? "failed"}:`, err?.stack || err);
+  void alert({
+    key: `api:${key}`,
+    title: opts?.title ?? `${key} failed`,
+    detail: err?.message || String(e),
+    level: opts?.level,
+    context: opts?.context,
+  });
+}
+
+// TTS provider resolution — mirrors vite.config.ts.
+
 
 // TTS provider resolution — mirrors vite.config.ts.
 
@@ -79,7 +120,56 @@ app.get("/api/status", (_req, res) => res.json(deployStatus({
   mapboxTokenInServerEnv: !!process.env.VITE_MAPBOX_TOKEN,
   authGate: authEnabled,
   emailConfigured: mailConfigured(),
+  renderConfigured: renderConfigured(),
+  /* What has been going wrong lately, as counts and signatures. Safe here because
+     `alertSummary()` is built for this endpoint and carries no message text — see the
+     note on StatusInput.alerts. */
+  alerts: alertSummary(),
 })));
+
+/* ---- A BROKEN SCREEN REPORTS ITSELF (9/16/2026) -----------------------------
+   `POST /api/client-error`. The browser was completely dark before this: no
+   `window.onerror`, no `unhandledrejection`, and `DashboardBoundary` caught render
+   errors and told NOBODY. A feature failing mid-demo reached us only if the SE
+   happened to mention it.
+
+   ⚠️⚠️ **REGISTERED BEFORE `installAuth`, WHICH IS A DELIBERATE TRADE.** Behind the
+   gate, an expired session turns the report into a 302 to Google and the error is
+   lost — and a session expiring mid-demo is exactly when things break. So this is
+   reachable without a session, and every consequence of that is handled rather than
+   hoped about: the body is capped, every field is truncated, the signature is
+   NAMESPACED `client:` so a caller cannot forge a server-side signature, and the
+   funnel's own hourly ceiling means the worst an abuser achieves is a handful of
+   messages followed by suppression. It writes nothing but bounded alert state.
+   ⚠️ It answers 204 whatever happens. A reporter that can fail gives the page a
+   second error to handle, on a path that only runs when something is already wrong. */
+app.post("/api/client-error", (req, res) => {
+  try {
+    const b = (req.body ?? {}) as Record<string, unknown>;
+    const str = (v: unknown, n: number) => (typeof v === "string" ? v.slice(0, n) : "");
+    const route = str(b.route, 120) || "unknown";
+    const name = str(b.name, 80) || "Error";
+    const message = str(b.message, 300);
+    const where = str(b.where, 40) || "window";
+    /* ⚠️ THE SIGNATURE IS THE ROUTE PLUS THE ERROR TYPE, NOT THE MESSAGE. A message
+       interpolates ids and numbers ("Cannot read properties of undefined (reading
+       'rows')" is stable, but plenty are not), and a signature that varies per
+       occurrence defeats the dedupe — the trap `alert()`'s own doc warns about. */
+    void alert({
+      key: `client:${route}:${name}`,
+      title: `Client error on ${route}`,
+      detail: `${name}: ${message}`,
+      context: {
+        route, caught: where,
+        prospect: str(b.prospect, 60) || undefined,
+        stack: str(b.stack, 600) || undefined,
+        userAgent: str(req.get("user-agent"), 160) || undefined,
+      },
+    });
+  } catch { /* a reporter must never throw — see above */ }
+  res.status(204).end();
+});
+
 
 /* PUBLIC NIGHTLY CANARY RESULT — timings + audit for the last generation run.
 
@@ -91,6 +181,42 @@ app.get("/api/status", (_req, res) => res.json(deployStatus({
    ⚠️ PUBLIC. engine/canary.ts::toPublic() decides what is safe to expose, and it
    deliberately omits the target company names and URLs. Do not add them here. */
 app.get("/api/canary", (_req, res) => res.json(canaryPublic()));
+
+/* ⚠️⚠️ THE CUSTOMER-FACING SURFACE — registered BEFORE `installAuth` because a customer has no
+   Google account, and it is the ONLY thing a customer can reach. Everything in
+   engine/share.ts is scoped to one demo, one password and one session; the staff routes
+   below stay behind the gate and never see a customer request. `/api/share/*` that the
+   handler does not own falls through to the gate, i.e. a 401, never to a staff route. */
+app.use("/api/share", async (req, res, next) => {
+  try {
+    const result = await handleShareApi(
+      req.method, req.originalUrl, req.body,
+      shareReqFrom(req.headers, req.socket.remoteAddress), realShareDeps(apiKey),
+    );
+    if (!result) return next();
+    res.setHeader("Cache-Control", "no-store");
+    if (result.setCookie) res.setHeader("Set-Cookie", result.setCookie);
+    res.status(result.status).json(result.body);
+  } catch (e: any) {
+    routeFailed("share", e, { level: isOverloaded(e) ? "record" : "page" });
+    res.status(isOverloaded(e) ? 503 : 500).json({ error: isOverloaded(e) ? "The AI is briefly overloaded. One moment, please resend." : "Something went wrong. Please try again." });
+  }
+});
+
+/* The customer bundle and the few public brand assets it draws, also ahead of the gate.
+   `/d/<slug>` is only a shell: it carries no demo data, which arrives from /api/share/<slug>/demo
+   after the password. The asset allow-list is fonts, the logo and icons: nothing per-prospect,
+   nothing staff. dist-customer/ is a separate build (vite.customer.config.ts), so the bundled
+   prospects are not in anything served here. */
+const DIST_CUSTOMER = path.join(ROOT, "dist-customer");
+app.use("/d-assets", express.static(DIST_CUSTOMER, { index: false, maxAge: "1h" }));
+for (const p of ["/fonts", "/icons"]) app.use(p, express.static(path.join(DIST, p)));
+for (const f of ["/logo.png", "/favicon.svg", "/icons.svg"]) app.get(f, (_req, res) => res.sendFile(path.join(DIST, f), (e) => { if (e) res.status(404).end(); }));
+app.get(/^\/d\/[A-Za-z0-9_-]+(\/.*)?$/, (_req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.setHeader("X-Robots-Tag", "noindex, nofollow");
+  res.sendFile(path.join(DIST_CUSTOMER, "customer.html"), (e) => { if (e) res.status(404).type("text/plain").send("Not found."); });
+});
 
 installAuth(app);
 
@@ -111,7 +237,7 @@ app.use(async (req, res, next) => {
     }
     res.status(result.status).json(result.body);
   } catch (e: any) {
-    console.error("[feedback] failed:", e);
+    routeFailed("feedback", e);
     res.status(500).json({ error: e?.message || "Feedback request failed." });
   }
 });
@@ -125,7 +251,7 @@ app.use(async (req, res, next) => {
     if (!result) return next();
     res.status(result.status).json(result.body);
   } catch (e: any) {
-    console.error("[demos] failed:", e);
+    routeFailed("demos", e);
     res.status(500).json({ error: e?.message || "Demo library request failed." });
   }
 });
@@ -154,10 +280,13 @@ app.post("/api/generate", async (req, res) => {
       fs.mkdirSync(OUT_DIR, { recursive: true });
       fs.writeFileSync(path.join(OUT_DIR, `${slugify(name)}.json`), JSON.stringify(profile, null, 2));
     } catch (writeErr) {
-      console.error("[generate] profile delivered but failed to persist to disk:", writeErr);
+      /* ⚠️ THE PROSPECT WAS DELIVERED AND THEN LOST. The SE sees a working demo and
+         it is gone on the next load — worth interrupting somebody over. */
+      routeFailed("generate-persist", writeErr,
+        { title: "Generation succeeded but the profile could not be written to disk" });
     }
   } catch (e: any) {
-    console.error("[generate] failed:", e);
+    routeFailed("generate", e, { title: "Generation failed" });
     sse({ type: "error", error: e?.message || "Generation failed." });
     res.end();
   }
@@ -172,7 +301,7 @@ app.post("/api/chat", async (req, res) => {
     const reply = await chatReply(brain, Array.isArray(messages) ? messages : [], apiKey, { voice: !!voice });
     res.json({ reply });
   } catch (e: any) {
-    console.error("[chat] failed:", e);
+    routeFailed("chat", e, { level: isOverloaded(e) ? "record" : "page" });
     res.status(isOverloaded(e) ? 503 : 500).json({ error: isOverloaded(e) ? "The AI is briefly overloaded — one moment, please resend." : e?.message || "Chat failed." });
   }
 });
@@ -198,7 +327,7 @@ app.post("/api/ai-assistant", async (req, res) => {
         const result = await askAssistant(input, apiKey, (p) => evt({ type: "progress", ...p }));
         evt({ type: "done", result });
       } catch (e: any) {
-        console.error("[ai-assistant] failed:", e);
+        routeFailed("ai-assistant", e, { level: isOverloaded(e) ? "record" : "page", context: { transport: "stream" } });
         evt({ type: "error", error: isOverloaded(e) ? "The AI is briefly overloaded — one moment, please resend." : e?.message || "Assistant failed." });
       }
       return res.end();
@@ -207,7 +336,7 @@ app.post("/api/ai-assistant", async (req, res) => {
     const result = await askAssistant(input, apiKey);
     res.json({ result });
   } catch (e: any) {
-    console.error("[ai-assistant] failed:", e);
+    routeFailed("ai-assistant", e, { level: isOverloaded(e) ? "record" : "page" });
     res.status(isOverloaded(e) ? 503 : 500).json({ error: isOverloaded(e) ? "The AI is briefly overloaded — one moment, please resend." : e?.message || "Assistant failed." });
   }
 });
@@ -225,7 +354,8 @@ app.get("/api/zip", async (req, res) => {
     if (!place) return res.status(404).json({ error: `We could not find ZIP ${zip}.` });
     res.json({ place });
   } catch (e: any) {
-    console.error("[zip] failed:", e);
+    /* One location pill degrades. Counted. */
+    routeFailed("zip", e, { level: "record" });
     res.status(500).json({ error: e?.message || "Location lookup failed." });
   }
 });
@@ -240,7 +370,9 @@ app.post("/api/analyze", async (req, res) => {
     /* `outcome` is voice-only and absent for SMS; the client ignores what it does not use. */
     res.json({ signals, outcome });
   } catch (e: any) {
-    console.error("[analyze] failed:", e);
+    /* Signals go MISSING from a report rather than wrong, which is the kind of
+       failure nobody notices until a prospect asks what the blank tab means. */
+    routeFailed("analyze", e);
     res.status(500).json({ error: e?.message || "Analyze failed." });
   }
 });
@@ -261,7 +393,9 @@ app.post("/api/voice-preview", async (req, res) => {
     res.setHeader("Cache-Control", "no-store");
     res.end(Buffer.from(wav));
   } catch (e: any) {
-    console.error("[voice-preview] failed:", e);
+    /* Also the path an unoffered voice takes, which is rejected input rather than a
+       fault, so this one is counted rather than paged. */
+    routeFailed("voice-preview", e, { level: "record" });
     res.status(400).json({ error: e?.message || "Preview failed." });
   }
 });
@@ -284,7 +418,8 @@ app.post("/api/livekit-token", async (req, res) => {
     if (!brain) return res.status(400).json({ error: "brain is required." });
     res.json(await mintVoiceToken({ brain, profileId: profileId || "demo", greeting, voice }, cfg));
   } catch (e: any) {
-    console.error("[livekit] token failed:", e);
+    /* No token means no voice call at all, for everybody. */
+    routeFailed("livekit-token", e, { title: "LiveKit token mint failed" });
     res.status(500).json({ error: e?.message || "Could not mint a LiveKit token." });
   }
 });
@@ -303,6 +438,117 @@ app.get("/api/place", async (req, res) => {
 });
 
 /* Mirrors the ogImageApi() plugin in vite.config.ts — keep the two in sync. */
+/* GET /api/replicate?url=… → the page itself as text/html (same-origin, so the Replicate
+   screen can wire its form); /api/replicate/probe?url=… → JSON metadata. engine/replicate.ts
+   does the work. Twin of the plugin in vite.config.ts — keep the two in sync. */
+async function replicateHandler(req: express.Request, res: express.Response, probe: boolean) {
+  const target = String(req.query.url || "");
+  const { fetchReplica } = await import("./engine/replicate.ts");
+  try {
+    const r = await fetchReplica(target);
+    if (probe) {
+      return res.json({ ok: true, finalUrl: r.finalUrl, title: r.title, forms: r.forms, formFields: r.formFields, bytes: r.bytes, ms: r.ms, via: r.via, fallbackReason: r.fallbackReason });
+    }
+    res.setHeader("Content-Type", "text/html; charset=utf-8");
+    res.setHeader("Cache-Control", "no-store");
+    return res.send(r.html);
+  } catch (e: any) {
+    const msg = e?.message || "Could not replicate that page.";
+    /* ⚠️ THIS PATH LOGGED NOTHING AT ALL before 9/16/2026 — worse than the bare
+       `console.error`s, because there was not even a line to find afterwards.
+       `record`, not `page`: a replicate failure is usually the TARGET site blocking a
+       datacenter IP (AutoNation and Orlando Health both do), which is not our fault and
+       not actionable at 2am. The count on /api/status is what makes a pattern visible. */
+    routeFailed("replicate", e, { level: "record", context: { url: target.slice(0, 120) } });
+    if (probe) return res.status(400).json({ ok: false, error: msg });
+    return res.status(400).type("html")
+      .send(`<!doctype html><meta charset="utf-8"><body style="font:14px system-ui;padding:40px;color:#333">${msg}</body>`);
+  }
+}
+app.get("/api/replicate/probe", (req, res) => { void replicateHandler(req, res, true); });
+app.get("/api/replicate", (req, res) => { void replicateHandler(req, res, false); });
+
+/* ⚠️⚠️ **THE REPLICATE BUTTON'S REAL PATH: download a standalone HTML file, save it, open it.**
+   POST /api/replicate/capture {url} → checks the persistent store first (instant if this
+   domain was already captured, even after a restart — that IS the point of the store), else
+   runs the full browser capture and saves the result. GET /api/replicate/lookup?url=|slug=
+   resolves what `/replica` should show, checking the two built-in library captures
+   (`replicaFor`/`replicaBySlug`, shipped in the repo) before the dynamic store. GET
+   /api/replicas/dyn/:file streams a stored capture's bytes — distinct from the static
+   `/replicas/*` names served out of `public/`, so the two can never collide.
+   Twin of the plugin in vite.config.ts — keep the two in sync. */
+app.post("/api/replicate/capture", async (req, res) => {
+  const target = String(req.body?.url || "");
+  const { assertPublicUrl } = await import("./engine/replicate.ts");
+  const { captureReplica } = await import("./engine/replicaCapture.ts");
+  const { getReplicaForDomain, saveReplica } = await import("./engine/replicaStore.ts");
+  let host: string;
+  try { host = assertPublicUrl(target).hostname; } catch (e: any) {
+    return res.status(400).json({ ok: false, error: e?.message || "That is not a usable URL." });
+  }
+  const existing = getReplicaForDomain(host);
+  if (existing) return res.json({ ok: true, slug: existing.slug, domain: existing.domain, sourceUrl: existing.sourceUrl, capturedAt: existing.capturedAt, label: existing.label, cached: true });
+  try {
+    const r = await captureReplica(target);
+    if (!r.ok) return res.status(400).json({ ok: false, error: r.reasons.join("; ") });
+    const slug = new URL(r.finalUrl).hostname.replace(/^www\./, "").split(".")[0].replace(/[^a-z0-9-]+/gi, "-").toLowerCase();
+    const domain = new URL(r.finalUrl).hostname.replace(/^www\./, "");
+    const rec = saveReplica(
+      { slug, file: `${slug}.html`, domain, sourceUrl: r.finalUrl, capturedAt: new Date().toISOString().slice(0, 10), label: r.title.replace(/\s*[-|·].*$/, "").trim() || slug, fields: r.map },
+      r.html,
+    );
+    return res.json({ ok: true, slug: rec.slug, domain: rec.domain, sourceUrl: rec.sourceUrl, capturedAt: rec.capturedAt, label: rec.label, cached: false });
+  } catch (e: any) {
+    /* Same reasoning as the fetch path above: counted, not paged. */
+    routeFailed("replicate-capture", e, { level: "record", context: { url: target.slice(0, 120) } });
+    return res.status(400).json({ ok: false, error: e?.message || "Could not replicate that page." });
+  }
+});
+
+app.get("/api/replicate/lookup", async (req, res) => {
+  const url = req.query.url ? String(req.query.url) : "";
+  const slugQ = req.query.slug ? String(req.query.slug) : "";
+  /* ⚠️ `replicaRegistry.ts`, NOT `replicaPages.ts` — that module is full of
+     `HTMLInputElement` and `Document`, and importing it here is what kept this whole
+     file out of `tsconfig.node.json` (and therefore out of every type check). */
+  const { replicaFor, replicaBySlug } = await import("./src/data/replicaRegistry.ts");
+  const { getReplicaForDomain, getReplicaBySlug } = await import("./engine/replicaStore.ts");
+  /* ⚠⚠ **A STATIC ENTRY IS ONLY REAL IF ITS CAPTURE IS ON THIS MACHINE, and trusting the
+     registry blindly is what produced a BLANK SCREEN on production.** `public/replicas/*.html`
+     is git-ignored on purpose (megabytes, pruned after 10 days), so a deploy has the registry
+     but NOT the files. Lookup answered `source: "static", file: "aptive.html"`, the page framed
+     `/replicas/aptive.html`, express.static missed, and the SPA catch-all below served
+     `index.html` INTO THE IFRAME — the app rendering itself with no route, i.e. blank. Worse
+     than a 404, because nothing anywhere reported a failure: Replicate had genuinely captured
+     the page and its bytes were sitting unused in the dynamic store.
+     Checking the file makes the registry fail CLOSED, falling through to that store. */
+  const staticReady = (file: string) => fs.existsSync(path.join(DIST, "replicas", file));
+  if (slugQ) {
+    const st = replicaBySlug(slugQ);
+    if (st && staticReady(st.file)) return res.json({ ok: true, source: "static", file: st.file, sourceUrl: st.sourceUrl, capturedAt: st.capturedAt, label: st.label, fields: st.fields ?? null });
+    const dyn = getReplicaBySlug(slugQ);
+    if (dyn) return res.json({ ok: true, source: "dynamic", file: dyn.file, sourceUrl: dyn.sourceUrl, capturedAt: dyn.capturedAt, label: dyn.label, fields: dyn.fields });
+    return res.json({ ok: false });
+  }
+  let host = "";
+  try { host = new URL(url).hostname; } catch { return res.json({ ok: false }); }
+  const st = replicaFor(host);
+  if (st && staticReady(st.file)) return res.json({ ok: true, source: "static", file: st.file, sourceUrl: st.sourceUrl, capturedAt: st.capturedAt, label: st.label, fields: st.fields ?? null });
+  const dyn = getReplicaForDomain(host);
+  if (dyn) return res.json({ ok: true, source: "dynamic", file: dyn.file, sourceUrl: dyn.sourceUrl, capturedAt: dyn.capturedAt, label: dyn.label, fields: dyn.fields });
+  return res.json({ ok: false });
+});
+
+app.get("/api/replicas/dyn/:file", async (req, res) => {
+  const { REPLICAS_DIR } = await import("./engine/replicaStore.ts");
+  const file = path.basename(String(req.params.file || ""));   // strip any path traversal
+  const full = path.join(REPLICAS_DIR, file);
+  if (!full.startsWith(REPLICAS_DIR + path.sep) || !fs.existsSync(full)) return res.status(404).end();
+  res.setHeader("Content-Type", "text/html; charset=utf-8");
+  res.setHeader("Cache-Control", "no-store");
+  fs.createReadStream(full).pipe(res);
+});
+
 app.get("/api/og-image", async (req, res) => {
   try {
     const { fetchOgImage } = await import("./engine/ogImage.ts");
@@ -327,7 +573,39 @@ app.post("/api/delete-profile", (req, res) => {
 
 // Static built app + SPA deep-link fallback (so /dashboards/marketing etc. work).
 app.use(express.static(DIST));
+/* ⚠⚠ **A MISSING CAPTURE 404s RATHER THAN BECOMING THE APP.** Reaching here means
+   express.static above did not find the file, and the SPA catch-all would otherwise hand back
+   `index.html` — which, framed by the replica screen, renders as a silent blank page instead of
+   a failure anyone can see. Registered before the catch-all and scoped to this one prefix, so
+   every real route still falls through to the SPA exactly as before. */
+app.get("/replicas/*", (_req, res) => res.status(404).type("text/plain").send("No such capture on this server."));
 app.get("*", (_req, res) => res.sendFile(path.join(DIST, "index.html")));
+
+/* ---- THE ERROR HANDLER, AND IT HAS TO BE LAST ------------------------------
+   There was none at all before 9/16/2026. An exception thrown inside a route
+   reached Express's default handler, which sends a bare 500 (the stack, in dev)
+   and logs nothing anybody sees — so a broken endpoint looked, from the browser,
+   exactly like a broken network.
+
+   ⚠️ **FOUR ARGUMENTS OR IT IS NOT AN ERROR HANDLER.** Express decides by arity:
+   a three-argument function registered here is treated as ordinary middleware and
+   silently never runs on an error. `_next` is therefore required even though it is
+   unused, and `audit:alerts` checks the signature for exactly that reason.
+   ⚠️ **AFTER the catch-all**, because Express runs middleware in registration
+   order and an error handler registered before the routes it protects sees
+   nothing. */
+app.use((err: any, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  /* The route, not the message, so one broken endpoint is one signature however
+     many different ways it manages to fail. */
+  void alert({
+    key: `route:${req.method}:${req.path.slice(0, 80)}`,
+    title: `Unhandled error in ${req.method} ${req.path.slice(0, 80)}`,
+    detail: err?.message || String(err),
+    context: { stack: String(err?.stack ?? "").slice(0, 600) },
+  });
+  if (res.headersSent) return;
+  res.status(500).json({ error: "Something went wrong on the server." });
+});
 
 const server = app.listen(PORT, () => {
   console.log(`Invoca demo running on http://localhost:${PORT}`);
@@ -342,6 +620,14 @@ const server = app.listen(PORT, () => {
      someone else cannot be updated from the browser. Content only, never
      ownership. */
   applyDemoPatches(DATA_DIR);
+  /* Event rosters committed under engine/event-seeds/ (see eventSeeds.ts for why
+     they cannot live in src/data/generated). Never overwrites an existing demo,
+     so this is a no-op on every boot after the first. */
+  const seeded = importEventSeeds();
+  if (seeded.added.length || seeded.failed.length) {
+    console.log(`🎟  Event seeds: ${seeded.added.length} added, ${seeded.skipped} already present`);
+    for (const f of seeded.failed) console.error(`   ⚠ skipped ${f}`);
+  }
   if (!apiKey) console.warn("⚠  ANTHROPIC_API_KEY not set — the AI features will return errors. Set it in the server environment (.env or host config).");
   scheduleCanary();
 });
@@ -383,6 +669,47 @@ function shutdown(signal: string): void {
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("SIGINT", () => shutdown("SIGINT"));
 
+/* ---- THE TWO THAT TAKE THE WHOLE SERVICE DOWN -------------------------------
+   ⚠️⚠️ **AWAITED, THEN EXIT — the one place in this codebase where an alert is
+   not fire-and-forget.** A floating promise dies with the process, so the single
+   most important notification this app can send is precisely the one that would
+   never leave. `alert()` cannot throw, so awaiting it cannot make the crash worse,
+   and the 3s cap means a dead channel delays the exit rather than hanging it.
+
+   ⚠️ **IT STILL EXITS.** Node's own guidance is that the process state is
+   undefined after an uncaught exception, and Render restarts it — which is the
+   right outcome. What was missing was anybody being told. The alert funnel's
+   cooldown is PERSISTED for exactly this path: a crash loop notifies once, not
+   once per boot. */
+async function crashed(kind: string, e: unknown): Promise<void> {
+  const err = e as any;
+  console.error(`✗  ${kind}:`, err?.stack || err);
+  await Promise.race([
+    alert({
+      key: `crash:${kind}:${String(err?.message ?? err).slice(0, 80)}`,
+      title: `${kind} — the service is restarting`,
+      detail: String(err?.stack ?? err).slice(0, 900),
+      context: { uptimeSeconds: Math.round(process.uptime()) },
+    }),
+    new Promise((r) => setTimeout(r, 3_000)),
+  ]);
+  process.exit(1);
+}
+
+process.on("uncaughtException", (e) => { void crashed("uncaughtException", e); });
+/* An unhandled rejection is NOT fatal in Node by default, and this deliberately
+   does not make it one: half the async paths here are third-party calls whose
+   rejection is a degraded feature, not a dead process. It is reported and the
+   service keeps serving. */
+process.on("unhandledRejection", (e) => {
+  console.error("✗  unhandledRejection:", e);
+  void alert({
+    key: `unhandledRejection:${String((e as any)?.message ?? e).slice(0, 80)}`,
+    title: "Unhandled promise rejection",
+    detail: String((e as any)?.stack ?? e).slice(0, 900),
+  });
+});
+
 /* ---- the nightly canary ----------------------------------------------------
    Runs one full generation at ~2am Eastern, times it, audits it, and throws the
    profile away (engine/canary.ts). It lives IN THE WEB PROCESS because this is
@@ -397,6 +724,42 @@ process.on("SIGINT", () => shutdown("SIGINT"));
 
    ⚠️ Every failure path is swallowed. A canary that can take down the web service
    the whole team demos on is far worse than no canary. */
+/* ⚠️ HOISTED OUT OF `scheduleCanary` (9/16/2026) so the attention check below can
+   use it too. Asking the clock what hour it is in America/New_York is DST-correct by
+   construction, which is why this exists rather than a UTC cron — see the block on
+   the scheduler. Two copies would be two answers to "what ET day is it". */
+const etParts = () => {
+  const f = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "America/New_York", year: "numeric", month: "2-digit",
+    day: "2-digit", hour: "2-digit", hour12: false,
+  }).formatToParts(new Date());
+  const get = (t: string) => f.find((p) => p.type === t)?.value ?? "";
+  return { date: `${get("year")}-${get("month")}-${get("day")}`, hour: Number(get("hour")) };
+};
+
+/* One notification per ET day, however many times the tick evaluates it. The alert
+   funnel's own 30-minute cooldown would otherwise allow ~48 a day for a signal that
+   only changes once a night, and a daily signal that pages twice an hour is a daily
+   signal you mute. */
+let lastAttentionDate = "";
+function alertOnCanary(): void {
+  try {
+    const pub = canaryPublic() as { needsAttention?: boolean; reason?: string | null };
+    if (!pub.needsAttention) return;
+    const { date } = etParts();
+    if (date === lastAttentionDate) return;
+    lastAttentionDate = date;
+    void alert({
+      key: "canary-needs-attention",
+      title: "Nightly generation check needs attention",
+      detail: pub.reason ?? "unknown",
+      context: { see: "/api/canary" },
+    });
+  } catch (e) {
+    console.error("🐤 canary attention check failed (ignored):", e);
+  }
+}
+
 function scheduleCanary(): void {
   const flag = (process.env.CANARY ?? "").toLowerCase();
   if (flag === "off") {
@@ -427,15 +790,6 @@ function scheduleCanary(): void {
   let running = false;
   let lastRunDate = "";                     // ET calendar date of the last run
 
-  const etParts = () => {
-    const f = new Intl.DateTimeFormat("en-CA", {
-      timeZone: "America/New_York", year: "numeric", month: "2-digit",
-      day: "2-digit", hour: "2-digit", hour12: false,
-    }).formatToParts(new Date());
-    const get = (t: string) => f.find((p) => p.type === t)?.value ?? "";
-    return { date: `${get("year")}-${get("month")}-${get("day")}`, hour: Number(get("hour")) };
-  };
-
   const tick = async () => {
     try {
       const { date, hour } = etParts();
@@ -450,14 +804,32 @@ function scheduleCanary(): void {
         : run.audit.failures.length ? `${run.audit.failures.length} audit failure(s) in ${run.totalSeconds}s`
         : `ok ${run.totalSeconds}s`;
       console.log(`🐤 Canary done — ${verdict} (slowest: ${run.slowestPhase})`);
+      /* ⚠️ THE VERDICT IS READ BACK OUT OF `toPublic()`, NOT RE-DERIVED HERE. That
+         function already decides what counts as needing attention — including
+         *missing* and *stale*, which a freshly-finished run cannot be — and two
+         copies of "is the canary unhappy" is how the Slack message and
+         `/api/canary` end up disagreeing about the same night. */
+      alertOnCanary();
     } catch (e) {
-      console.error("🐤 Canary tick failed (ignored):", e);
+      /* ⚠️ THE CANARY FAILING TO RUN IS THE "SILENCE IS NOT SUCCESS" CASE, and it was
+         only caught indirectly: no run recorded means `toPublic()` reports *stale* the
+         NEXT day, and `alertOnCanary` reports that. True, but a day late. One line makes
+         it immediate, and the funnel's cooldown keeps a repeatedly-failing tick quiet. */
+      routeFailed("canary-tick", e, { title: "Nightly canary tick failed to run" });
     } finally {
       running = false;
     }
   };
 
   setInterval(tick, TICK_MS).unref?.();
+  /* ⚠️⚠️ **THE CANARY NOT RUNNING IS ITSELF A FAILURE, AND NOTHING WAS CHECKING.**
+     `toPublic()` has always treated *missing* and *stale* as needing attention —
+     "a monitor whose 'nothing wrong' and 'not working' look identical is worse
+     than no monitor" — but that verdict was only ever computed when somebody
+     READ the endpoint. If the tick died, or generation quietly broke, the
+     endpoint sat there saying so and nobody was told. This evaluates it on the
+     same tick and reports at most once per ET day. */
+  setInterval(alertOnCanary, TICK_MS).unref?.();
   console.log(`🐤 Nightly canary armed for ~${HOUR}:00 America/New_York (budget ${BUDGET_SECONDS}s).`);
   /* Opt-in immediate run, for verifying the wiring without waiting for 2am. */
   if ((process.env.CANARY_ON_BOOT ?? "") === "1") {

@@ -29,7 +29,8 @@ function generateApi(apiKey: string | undefined): Plugin {
         try {
           let raw = ''
           for await (const chunk of req) raw += chunk
-          const { name, url } = JSON.parse(raw || '{}')
+          const body = JSON.parse(raw || '{}')
+          const { name, url } = body
           if (!name || !url) { sse({ type: 'error', error: 'Both a prospect name and a website URL are required.' }); return res.end() }
           if (!apiKey) { sse({ type: 'error', error: 'ANTHROPIC_API_KEY is not set. Add it to .env or export it before `npm run dev`.' }); return res.end() }
 
@@ -88,6 +89,123 @@ function deleteProfileApi(): Plugin {
           return send(200, { ok: true, deleted: false })  // seed or already gone
         } catch (e: any) {
           send(500, { error: e?.message || 'Delete failed.' })
+        }
+      })
+    },
+  }
+}
+
+/* GET /api/replicate?url=… → the page itself as text/html (served same-origin so the
+   Replicate screen can wire its form), and /api/replicate/probe?url=… → JSON metadata.
+   engine/replicate.ts does the work; this is the transport. Mirrored in server.ts. */
+/* ⚠️ MIRRORS server.ts — keep the two in sync. Same three routes: POST capture, GET lookup,
+   GET the stored file's bytes. */
+function replicateCaptureApi(): Plugin {
+  return {
+    name: 'invoca-replicate-capture-api',
+    configureServer(server) {
+      server.middlewares.use(async (req, res, next) => {
+        const u = new URL(req.url || '', 'http://x')
+
+        if (req.method === 'POST' && u.pathname === '/api/replicate/capture') {
+          let raw = ''
+          for await (const chunk of req) raw += chunk
+          const { url: target } = JSON.parse(raw || '{}')
+          const send = (code: number, body: unknown) => {
+            res.statusCode = code
+            res.setHeader('Content-Type', 'application/json')
+            res.end(JSON.stringify(body))
+          }
+          const { assertPublicUrl } = await import(pathToFileURL(path.resolve(process.cwd(), 'engine/replicate.ts')).href)
+          let host: string
+          try { host = assertPublicUrl(target).hostname } catch (e: any) { return send(400, { ok: false, error: e?.message || 'That is not a usable URL.' }) }
+          const { getReplicaForDomain, saveReplica } = await import(pathToFileURL(path.resolve(process.cwd(), 'engine/replicaStore.ts')).href)
+          const existing = getReplicaForDomain(host)
+          if (existing) return send(200, { ok: true, slug: existing.slug, domain: existing.domain, sourceUrl: existing.sourceUrl, capturedAt: existing.capturedAt, label: existing.label, cached: true })
+          try {
+            const { captureReplica } = await import(pathToFileURL(path.resolve(process.cwd(), 'engine/replicaCapture.ts')).href)
+            const r = await captureReplica(target)
+            if (!r.ok) return send(400, { ok: false, error: r.reasons.join('; ') })
+            const slug = new URL(r.finalUrl).hostname.replace(/^www\./, '').split('.')[0].replace(/[^a-z0-9-]+/gi, '-').toLowerCase()
+            const domain = new URL(r.finalUrl).hostname.replace(/^www\./, '')
+            const rec = saveReplica({ slug, file: `${slug}.html`, domain, sourceUrl: r.finalUrl, capturedAt: new Date().toISOString().slice(0, 10), label: r.title.replace(/\s*[-|·].*$/, '').trim() || slug, fields: r.map }, r.html)
+            return send(200, { ok: true, slug: rec.slug, domain: rec.domain, sourceUrl: rec.sourceUrl, capturedAt: rec.capturedAt, label: rec.label, cached: false })
+          } catch (e: any) {
+            return send(400, { ok: false, error: e?.message || 'Could not replicate that page.' })
+          }
+        }
+
+        if (req.method === 'GET' && u.pathname === '/api/replicate/lookup') {
+          const url = u.searchParams.get('url') || ''
+          const slugQ = u.searchParams.get('slug') || ''
+          const send = (body: unknown) => { res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(body)) }
+          const { replicaFor, replicaBySlug } = await import(pathToFileURL(path.resolve(process.cwd(), 'src/data/replicaRegistry.ts')).href)
+          const { getReplicaForDomain, getReplicaBySlug } = await import(pathToFileURL(path.resolve(process.cwd(), 'engine/replicaStore.ts')).href)
+          /* ⚠️ SAME FAIL-CLOSED RULE AS server.ts — see the long note there. A registry entry
+             whose capture is not on this machine must fall through to the dynamic store, or the
+             page frames a path that does not exist. Dev serves them from public/. */
+          const staticReady = (file: string) => fs.existsSync(path.resolve(process.cwd(), 'public/replicas', file))
+          if (slugQ) {
+            const st = replicaBySlug(slugQ)
+            if (st && staticReady(st.file)) return send({ ok: true, source: 'static', file: st.file, sourceUrl: st.sourceUrl, capturedAt: st.capturedAt, label: st.label, fields: st.fields ?? null })
+            const dyn = getReplicaBySlug(slugQ)
+            if (dyn) return send({ ok: true, source: 'dynamic', file: dyn.file, sourceUrl: dyn.sourceUrl, capturedAt: dyn.capturedAt, label: dyn.label, fields: dyn.fields })
+            return send({ ok: false })
+          }
+          let host = ''
+          try { host = new URL(url).hostname } catch { return send({ ok: false }) }
+          const st = replicaFor(host)
+          if (st && staticReady(st.file)) return send({ ok: true, source: 'static', file: st.file, sourceUrl: st.sourceUrl, capturedAt: st.capturedAt, label: st.label, fields: st.fields ?? null })
+          const dyn = getReplicaForDomain(host)
+          if (dyn) return send({ ok: true, source: 'dynamic', file: dyn.file, sourceUrl: dyn.sourceUrl, capturedAt: dyn.capturedAt, label: dyn.label, fields: dyn.fields })
+          return send({ ok: false })
+        }
+
+        const m = u.pathname.match(/^\/api\/replicas\/dyn\/(.+)$/)
+        if (req.method === 'GET' && m) {
+          const { REPLICAS_DIR } = await import(pathToFileURL(path.resolve(process.cwd(), 'engine/replicaStore.ts')).href)
+          const file = path.basename(m[1])
+          const full = path.join(REPLICAS_DIR, file)
+          if (!full.startsWith(REPLICAS_DIR + path.sep) || !fs.existsSync(full)) { res.statusCode = 404; return res.end() }
+          res.setHeader('Content-Type', 'text/html; charset=utf-8')
+          res.setHeader('Cache-Control', 'no-store')
+          return fs.createReadStream(full).pipe(res)
+        }
+
+        next()
+      })
+    },
+  }
+}
+
+function replicateApi(): Plugin {
+  return {
+    name: 'invoca-replicate-api',
+    configureServer(server) {
+      server.middlewares.use('/api/replicate', async (req, res) => {
+        const u = new URL(req.url || '', 'http://x')
+        const target = u.searchParams.get('url') || ''
+        const probe = u.pathname.startsWith('/probe')
+        const mod = await import(pathToFileURL(path.resolve(process.cwd(), 'engine/replicate.ts')).href)
+        try {
+          const r = await mod.fetchReplica(target)
+          if (probe) {
+            res.setHeader('Content-Type', 'application/json')
+            return res.end(JSON.stringify({ ok: true, finalUrl: r.finalUrl, title: r.title, forms: r.forms, formFields: r.formFields, bytes: r.bytes, ms: r.ms, via: r.via, fallbackReason: r.fallbackReason }))
+          }
+          res.setHeader('Content-Type', 'text/html; charset=utf-8')
+          res.setHeader('Cache-Control', 'no-store')
+          return res.end(r.html)
+        } catch (e: any) {
+          const msg = e?.message || 'Could not replicate that page.'
+          if (probe) {
+            res.statusCode = 400
+            res.setHeader('Content-Type', 'application/json')
+            return res.end(JSON.stringify({ ok: false, error: msg }))
+          }
+          res.statusCode = 400
+          res.setHeader('Content-Type', 'text/html; charset=utf-8')
+          return res.end(`<!doctype html><meta charset="utf-8"><body style="font:14px system-ui;padding:40px;color:#333">${msg}</body>`)
         }
       })
     },
@@ -187,6 +305,48 @@ function ogImageApi(): Plugin {
   }
 }
 
+/* Dev twin of POST /api/client-error — see the long note in server.ts for why the
+   endpoint exists, why it sits outside the auth gate and why every field is capped.
+
+   ⚠️ IT HAS TO EXIST HERE TOO, even though nobody watches alerts on a laptop: the
+   client hook posts unconditionally, and a dev server with no such route answers the
+   SPA's index.html with a 200, so the browser would report "sent" for a report that
+   went nowhere. Locally the funnel logs rather than sending (non-production), which
+   is exactly what makes the wiring testable without a channel. */
+function clientErrorApi(): Plugin {
+  return {
+    name: 'invoca-client-error-api',
+    configureServer(server) {
+      server.middlewares.use('/api/client-error', async (req, res, next) => {
+        if (req.method !== 'POST') return next()
+        try {
+          const chunks: Buffer[] = []
+          for await (const c of req) chunks.push(c as Buffer)
+          const raw = Buffer.concat(chunks).toString('utf8').slice(0, 8192)
+          const b = JSON.parse(raw || '{}') as Record<string, unknown>
+          const str = (v: unknown, n: number) => (typeof v === 'string' ? v.slice(0, n) : '')
+          const route = str(b.route, 120) || 'unknown'
+          const name = str(b.name, 80) || 'Error'
+          const { alert } = await import(pathToFileURL(path.resolve(process.cwd(), 'engine/alerts.ts')).href)
+          void alert({
+            key: `client:${route}:${name}`,
+            title: `Client error on ${route}`,
+            detail: `${name}: ${str(b.message, 300)}`,
+            context: {
+              route,
+              caught: str(b.where, 40) || 'window',
+              prospect: str(b.prospect, 60) || undefined,
+              stack: str(b.stack, 600) || undefined,
+            },
+          })
+        } catch { /* a reporter must never throw */ }
+        res.statusCode = 204
+        res.end()
+      })
+    },
+  }
+}
+
 /* GET /api/status — the same public deploy-status payload the prod server serves,
    from the same module, so the two can't drift. Locally the RENDER_* fields come
    back null, which is exactly how you tell a dev server from the real deploy. */
@@ -199,6 +359,7 @@ function statusApi(): Plugin {
         try {
           const { deployStatus } = await import(pathToFileURL(path.resolve(process.cwd(), 'engine/status.ts')).href)
           const { authEnabled } = await import(pathToFileURL(path.resolve(process.cwd(), 'googleAuth.ts')).href)
+          const { alertSummary } = await import(pathToFileURL(path.resolve(process.cwd(), 'engine/alerts.ts')).href)
           const env = loadEnv('development', process.cwd(), '')
           res.statusCode = 200
           res.setHeader('Content-Type', 'application/json')
@@ -208,7 +369,9 @@ function statusApi(): Plugin {
             googlePlacesKey: !!env.GOOGLE_PLACES_API_KEY,
             mapboxTokenInServerEnv: !!env.VITE_MAPBOX_TOKEN,
             emailConfigured: !!(env.SMTP_USER && env.SMTP_APP_PASSWORD),
+            renderConfigured: Boolean(env.BROWSERLESS_TOKEN || process.env.BROWSERLESS_TOKEN),
             authGate: authEnabled,
+            alerts: alertSummary(),
           })))
         } catch (e: any) {
           console.error('[status] failed:', e)
@@ -268,13 +431,56 @@ function feedbackApi(): Plugin {
   }
 }
 
+/* The customer-facing share API (/api/share/*) — twin of the app.use("/api/share") block in
+   server.ts, so a shared demo can be exercised locally. Keep the two in sync. Everything it
+   does is policy in engine/share.ts; this is only the transport. */
+function shareApi(apiKey: string | undefined): Plugin {
+  return {
+    name: 'invoca-share-api',
+    configureServer(server) {
+      server.middlewares.use(async (req, res, next) => {
+        const url = req.url || ''
+        if (!url.startsWith('/api/share/')) return next()
+        try {
+          let raw = ''
+          if (req.method !== 'GET') for await (const chunk of req) raw += chunk
+          const [{ handleShareApi, shareReqFrom }, { realShareDeps }] = await Promise.all([
+            import(pathToFileURL(path.resolve(process.cwd(), 'engine/share.ts')).href),
+            import(pathToFileURL(path.resolve(process.cwd(), 'engine/shareDeps.ts')).href),
+          ])
+          const result = await handleShareApi(
+            req.method || 'GET', url, raw ? JSON.parse(raw) : undefined,
+            shareReqFrom(req.headers, req.socket.remoteAddress), realShareDeps(apiKey),
+          )
+          if (!result) return next()
+          res.statusCode = result.status
+          res.setHeader('Content-Type', 'application/json')
+          res.setHeader('Cache-Control', 'no-store')
+          if (result.setCookie) res.setHeader('Set-Cookie', result.setCookie)
+          res.end(JSON.stringify(result.body))
+        } catch (e: any) {
+          console.error('[share] failed:', e)
+          res.statusCode = 500
+          res.setHeader('Content-Type', 'application/json')
+          res.end(JSON.stringify({ error: 'Something went wrong. Please try again.' }))
+        }
+      })
+    },
+  }
+}
+
 function demoLibraryApi(): Plugin {
   return {
     name: 'invoca-demo-library-api',
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
         const url = req.url || ''
-        if (!url.startsWith('/api/me') && !url.startsWith('/api/demos')) return next()
+        /* ⚠️ WIDENED 9/21/2026 to admit /api/admin-notice/ack alongside /api/me
+           and /api/demos — handleDemoApi owns all three, and a narrower prefix
+           here silently 404s a route the production twin already serves (that
+           one forwards every /api/* path and lets handleDemoApi return null). */
+        if (!url.startsWith('/api/me') && !url.startsWith('/api/demos')
+          && !url.startsWith('/api/admin-notice')) return next()
         try {
           let raw = ''
           if (req.method !== 'GET' && req.method !== 'DELETE') for await (const chunk of req) raw += chunk
@@ -533,11 +739,15 @@ export default defineConfig(({ mode }) => {
       react(),
       generateApi(apiKey),
       deleteProfileApi(),
+      replicateCaptureApi(),   // BEFORE replicateApi() — its /api/replicate prefix-match would otherwise swallow /api/replicate/capture and /lookup
+      replicateApi(),
       placeApi(),
       ogImageApi(),
       demoLibraryApi(),
+      shareApi(apiKey),
     feedbackApi(),
       statusApi(),
+      clientErrorApi(),
       chatApi(apiKey),
       assistantApi(apiKey),
       analyzeApi(apiKey),

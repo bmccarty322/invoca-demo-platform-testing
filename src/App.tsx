@@ -1,8 +1,10 @@
 import { useEffect, type ReactNode } from "react";
 import { BrowserRouter, Routes, Route, useLocation } from "react-router-dom";
+import { ScreenBoundary } from "./components/DashboardBoundary";
 import { ProfileProvider } from "./data/ProfileContext";
 import { SmsCaptureProvider } from "./data/SmsCaptureContext";
 import { VoiceCaptureProvider } from "./data/VoiceCaptureContext";
+import { QuoteCaptureProvider } from "./data/QuoteCaptureContext";
 import { AiAssistantProvider } from "./data/AiAssistantContext";
 import { DemoLibraryProvider } from "./data/DemoLibraryContext";
 import { AppShell } from "./layout/AppShell";
@@ -51,13 +53,14 @@ import { SalesforceLeads } from "./screens/SalesforceLeads";
 import { SalesforceCallLog } from "./screens/SalesforceCallLog";
 import { SalesforceLeadDetail } from "./screens/SalesforceLeadDetail";
 import { SalesforceCallLogDetail } from "./screens/SalesforceCallLogDetail";
+import { ReplicaPageScreen } from "./screens/ReplicaPage";
 import { GoogleSearch } from "./screens/GoogleSearch";
 import { Placeholder } from "./screens/Placeholder";
-import { ReadmeButton } from "./components/ReadmeButton";
 import { EnvBadge } from "./components/EnvBadge";
-import { FeedbackButton } from "./components/FeedbackButton";
-import { InboxButton } from "./components/InboxButton";
+import { AdminNoticeModal } from "./components/AdminNoticeModal";
+import { LaunchMenu } from "./components/LaunchMenu";
 import { FeedbackBoard } from "./screens/FeedbackBoard";
+import { ReleaseNotes } from "./screens/ReleaseNotes";
 import { NAV } from "./components/nav";
 
 /* Some screens are EXACT static copies of real pages (the Invoca Exchange and
@@ -84,22 +87,18 @@ const BUILT: Record<string, ReactNode> = {
    standalone; the exact-copy marketing page still is. */
 const STANDALONE = new Set(["/invoca-exchange"]);
 
-/* The bottom-right pair on the launch form. Same allow-list as ReadmeButton: past
-   the launch form every screen is a replica of Invoca's product shown to a
-   prospect, and neither of these belongs on top of that. */
-const CORNER_ON = ["/", "/launch", "/feedback"];
+/* WHERE OUR OWN CHROME MAY APPEAR: the launch form only. Past it every screen is
+   a replica of Invoca's product shown to a prospect, and our buttons do not
+   belong on top of that. Unchanged when the bottom-right stack of three pills
+   became one top-right hamburger (9/10/2026) — if anything the rule matters MORE
+   there, since the top right of a replica is where real product chrome sits. */
+const MENU_ON = ["/", "/launch", "/feedback", "/release-notes"];
 function LaunchCorner() {
   const { pathname } = useLocation();
-  if (!CORNER_ON.includes(pathname)) return null;
-  return (
-    <div className="corner-stack">
-      {/* Admin only, and it hides itself: see InboxButton. Provisional placement,
-          which is why it is one line here rather than woven into Support. */}
-      <InboxButton />
-      <FeedbackButton />
-      <ReadmeButton />
-    </div>
-  );
+  if (!MENU_ON.includes(pathname)) return null;
+  /* Read.Me, Support and the admin Inbox all live inside it now. Add the next one
+     as an entry in its `items` array, not as a second button out here. */
+  return <LaunchMenu />;
 }
 
 export default function App() {
@@ -108,6 +107,7 @@ export default function App() {
       <DemoLibraryProvider>
       <SmsCaptureProvider>
       <VoiceCaptureProvider>
+      <QuoteCaptureProvider>
       <AiAssistantProvider>
       <BrowserRouter>
         {/* ⚠️⚠️ INSIDE THE ROUTER BUT OUTSIDE `<Routes>`, and NOT inside `LaunchCorner`.
@@ -118,6 +118,22 @@ export default function App() {
             phone preview, Google Search and the Salesforce pages all render outside the
             shell, so a TopBar chip would miss them as well. */}
         <EnvBadge />
+        {/* ⚠️ SAME REASONING AS `EnvBadge` DIRECTLY ABOVE: inside the router but
+            outside `<Routes>`, so it can render whichever route someone lands on
+            right after signing in — including the standalone ones a route-scoped
+            mount would miss entirely. It renders nothing until the server says
+            there is a notice to show (`DemoLibraryContext.adminNotice`). */}
+        <AdminNoticeModal />
+        {/* ⚠️⚠️ **EVERY ROUTE GETS A NET, INCLUDING THE SHELL'S OWN CHROME (9/16/2026).**
+            `DashboardBoundary` lives INSIDE `AppShell`, around its `<Outlet/>` — so it
+            catches a screen, and catches nothing thrown by the TopBar, the Sidebar, or any
+            of the standalone routes above (Launch, the phone preview, Google Search, the
+            four Salesforce screens, `/replica`). Any of those throwing blanked the whole
+            app and reported nothing.
+            ⚠️ Nesting is deliberate: React uses the NEAREST boundary, so an in-shell screen
+            still gets `DashboardBoundary`'s Undo fallback and this one only ever handles
+            what that cannot reach. */}
+        <ScreenBoundary>
         <Routes>
           {/* Launch screen (new prospect / revisit) — full-page, outside the shell */}
           <Route path="/" element={<Launch />} />
@@ -127,6 +143,10 @@ export default function App() {
               the TOOL, not about a prospect's demo, so wrapping it in the Invoca
               replica chrome would misrepresent what you are looking at. */}
           <Route path="/feedback" element={<FeedbackBoard />} />
+
+          {/* Release notes. Full-page and outside the shell for the same reason as
+              the feedback board — it is about the tool, not a prospect's demo. */}
+          <Route path="/release-notes" element={<ReleaseNotes />} />
 
           {/* Standalone full-page routes (no sidebar/topbar) — exact static copies */}
           {/* ⚠️ THE OLD EXACT-COPY OF invoca.com/integrations IS NOT DELETED — it still
@@ -157,6 +177,11 @@ export default function App() {
               sponsored slot, and the click carries the paid parameters into
               their site. Standalone, because it is not an Invoca screen. */}
           <Route path="/google-search" element={<GoogleSearch />} />
+          {/* The prospect's own booking page, replicated — opened by Replicate in the
+              Book online menu. Standalone like the search screen: it is somebody else's
+              site, so it must not render inside Invoca chrome. */}
+          <Route path="/replica" element={<ReplicaPageScreen />} />
+          <Route path="/replica/:slug" element={<ReplicaPageScreen />} />
 
           {/* Preview Agent (SMS) — opens in its own browser tab from Agent Workflow */}
           <Route path="/agent-studio/agent/preview" element={<SmsPreviewPage />} />
@@ -185,6 +210,9 @@ export default function App() {
             <Route path="/reports/conversation-intelligence/silver" element={<ConversationIntelligence tier="silver" />} />
             <Route path="/reports/conversation-intelligence/gold" element={<ConversationIntelligence tier="gold" />} />
             <Route path="/reports/sms-conversation-intelligence" element={<SmsConversationIntelligence />} />
+            {/* The quote-request threads, listed as "AI SMS Conversation Intelligence (LSA)".
+                Same component, opt-in filter — see its own header. */}
+            <Route path="/reports/sms-conversation-intelligence/lsa" element={<SmsConversationIntelligence only="lsa" />} />
             <Route path="/reports/voice-conversation-intelligence" element={<VoiceConversationIntelligence />} />
             <Route path="/reports/artifact/:id" element={<ArtifactView />} />
             {/* Dashboards nav → Manage list; individual dashboards open from there */}
@@ -225,12 +253,14 @@ export default function App() {
             ))}
           </Route>
         </Routes>
+        </ScreenBoundary>
         {/* Outside <Routes> so it renders on every screen, Launch included -- but inside
             <BrowserRouter>, because they read the path to stay off the prospect-facing
             pages. Both live in one fixed corner stack so they cannot overlap. */}
         <LaunchCorner />
       </BrowserRouter>
       </AiAssistantProvider>
+      </QuoteCaptureProvider>
       </VoiceCaptureProvider>
       </SmsCaptureProvider>
       </DemoLibraryProvider>
