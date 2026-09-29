@@ -66,6 +66,10 @@ ok(/CUSTOMER\) return; setFocus/.test(code("src/data/AiAssistantContext.tsx")), 
 const css = read("src/customer/customer.css");
 for (const c of [".tb-ai", ".pp-ai", ".dash-ai-tile", ".vp-icon-ai", ".wcp-icon-hover", ".ag-create-wf", ".as-create"]) ok(css.includes(c), `customer.css hides ${c}`);
 const app = code("src/customer/CustomerApp.tsx");
+ok(/\["\/agent-studio", "\/reports"\]/.test(app) && !/Route path="\/(dashboards|call-review)/.test(app), "the customer rail is Agent Studio and Reports only, and dashboards / Call Review have no routes");
+ok(/Route path="\/reports\/sms-conversation-intelligence"/.test(app) && /Route path="\/reports\/voice-conversation-intelligence"/.test(app) && (app.match(/Route path="\/reports\//g) ?? []).length === 2, "only the two AI conversation reports are routable");
+ok(/CUSTOMER \? allRows\.filter/.test(code("src/screens/MyReports.tsx")), "My Reports lists only those two reports for a customer");
+ok(/<Navigate to="\/agent-studio" replace \/>/.test(app) && !/Navigate to="\/dashboards/.test(app), "the customer lands on Agent Studio");
 ok(/hydrateDemo\([^)]*,\s*false,/.test(app), "the saved data layer loads READ-ONLY");
 ok(!/from "\.\.\/screens\/(Launch|GoogleSearch|Salesforce\w*|Insights\w*|Signal\w*|SemanticSignal\w*|FeedbackBoard|ReplicaPage|Integrations|ChatGptAd)"/.test(app) && !/DemoLibraryContext|AiAssistantDrawer/.test(app), "the customer route table imports no staff, library or replica screen");
 ok(/isSupportWorkflowPath/.test(code("src/screens/AgentStudio.tsx")) && /isSupportWorkflowPath/.test(code("src/screens/AgentStudioLayout.tsx")) && /w\.support/.test(code("src/data/quoteWorkflow.ts")), "a customer sees only the Support workflows");

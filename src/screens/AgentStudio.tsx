@@ -84,7 +84,7 @@ export function AgentStudio() {
             <th>Status</th>
             <th>Channel</th>
             <th>Type</th>
-            <th>Triggered By</th>
+            {!CUSTOMER && <th>Triggered By</th>}
             <th className="as-sorted">Last Updated <span className="material-icons">arrow_downward</span></th>
             <th>Went Live On</th>
             <th className="as-col-menu"></th>
@@ -111,7 +111,7 @@ export function AgentStudio() {
               <td><span className={w.created ? "as-status-draft" : "as-status-live"}>{w.status}</span></td>
               <td>{w.channel}</td>
               <td>{w.type}</td>
-              <td><span className="as-pill">{w.triggeredBy}</span></td>
+              {!CUSTOMER && <td><span className="as-pill">{w.triggeredBy}</span></td>}
               <td>{w.updated}</td>
               <td className={w.live === "-" ? "as-dash" : undefined}>{w.live}</td>
               <td className="as-menu">

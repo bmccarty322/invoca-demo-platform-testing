@@ -42,7 +42,9 @@ const pb = fallbackSupportPlaybook(p0);
 const sms = smsSystemPromptForAudit(supportBrain(p0, pb, "sms") as any);
 const voice = voiceSystemPrompt(supportBrain(p0, pb, "voice") as any);
 for (const [name, t] of [["SMS", sms], ["voice", voice]] as const) {
-  ok(/CONTAINMENT/.test(t) && /solve their problem yourself/.test(t), `${name}: told to contain, not hand off`);
+  ok(/CONTAINMENT/.test(t) && /solve it yourself/.test(t), `${name}: told to contain, not hand off`);
+  ok(/do not know yet/i.test(t) && /Do NOT assume they are an existing customer/.test(t) && !/EXISTING customer who needs help/.test(t), `${name}: does not assume an existing customer with a problem`);
+  ok(/use only once it is an account matter/.test(t), `${name}: the account record is used only once it is an account matter`);
   ok(t.includes(pb.escalation.directLine) && /live agent/i.test(t) && /callback/i.test(t), `${name}: offers a person, a callback and the direct line`);
   ok(t.includes(SUPPORT_LINES.live) && t.includes(SUPPORT_LINES.callback), `${name}: has the exact lines a reader can detect an escalation by`);
   ok(pb.scenarios.every((s) => t.includes(s.title.toUpperCase()) && t.includes(s.lookup)), `${name}: carries every scenario and its invented lookup`);

@@ -23,22 +23,8 @@ import { Sidebar } from "../components/Sidebar";
 import { NAV } from "../components/nav";
 import { installCustomerApi, type CustomerEvent } from "./api";
 import { MyReports } from "../screens/MyReports";
-import { DigitalInsights } from "../screens/DigitalInsights";
-import { ConversationIntelligence } from "../screens/ConversationIntelligence";
 import { SmsConversationIntelligence } from "../screens/SmsConversationIntelligence";
 import { VoiceConversationIntelligence } from "../screens/VoiceConversationIntelligence";
-import { ArtifactView } from "../screens/ArtifactView";
-import { MarketingDashboard } from "../screens/MarketingDashboard";
-import { MarketingOpsDashboard } from "../screens/MarketingOpsDashboard";
-import { AiAgentConversionDashboard } from "../screens/AiAgentConversionDashboard";
-import { AiMessagingImpactDashboard } from "../screens/AiMessagingImpactDashboard";
-import { QualityManagementDashboard } from "../screens/QualityManagementDashboard";
-import { QmInstantInsightsDashboard } from "../screens/QmInstantInsightsDashboard";
-import { LocationComparisonDashboard } from "../screens/LocationComparisonDashboard";
-import { FranchiseAiDashboard } from "../screens/FranchiseAiDashboard";
-import { ManageDashboards } from "../screens/ManageDashboards";
-import { CallReview } from "../screens/CallReview";
-import { CallDetail } from "../screens/CallDetail";
 import { AgentStudio } from "../screens/AgentStudio";
 import { AgentConfig } from "../screens/AgentConfig";
 import { KnowledgeSources } from "../screens/KnowledgeSources";
@@ -48,7 +34,7 @@ import { SmsPreviewPage } from "../screens/SmsPreviewPage";
 import { SUPPORT_SMS_SLUG, SUPPORT_VOICE_SLUG } from "../data/supportPlaybook";
 
 /** The rail a customer sees. Everything else in the product is not part of this demo. */
-const ALLOWED_NAV = NAV.filter((n) => ["/dashboards", "/call-review", "/agent-studio", "/reports"].includes(n.path));
+const ALLOWED_NAV = NAV.filter((n) => ["/agent-studio", "/reports"].includes(n.path));
 
 interface Loaded {
   state: "live" | "soft-expired";
@@ -191,29 +177,20 @@ function Demo({ data, slug }: { data: Loaded; slug: string }) {
           <BrowserRouter basename={`/d/${slug}`}>
             <ScreenBoundary>
               <Routes>
-                <Route path="/" element={<Navigate to="/dashboards/marketing" replace />} />
+                <Route path="/" element={<Navigate to="/agent-studio" replace />} />
                 <Route path="/agent-studio/agent/preview" element={<SmsPreviewPage />} />
                 <Route element={<Shell data={data} events={events} />}>
-                  <Route path="/dashboards" element={<ManageDashboards />} />
-                  <Route path="/dashboards/marketing" element={<MarketingDashboard />} />
-                  <Route path="/dashboards/marketing-ops" element={<MarketingOpsDashboard />} />
-                  <Route path="/dashboards/ai-agent-conversion" element={<AiAgentConversionDashboard />} />
-                  <Route path="/dashboards/ai-messaging-impact" element={<AiMessagingImpactDashboard />} />
-                  <Route path="/dashboards/quality-management" element={<QualityManagementDashboard />} />
-                  <Route path="/dashboards/qm-instant-insights" element={<QmInstantInsightsDashboard />} />
-                  <Route path="/dashboards/location-comparison" element={<LocationComparisonDashboard />} />
-                  <Route path="/dashboards/ai-conversion-by-location" element={<FranchiseAiDashboard />} />
-                  <Route path="/call-review" element={<CallReview />} />
-                  <Route path="/call-review/detail" element={<CallDetail />} />
+
+
+
+
+
+
+
+
                   <Route path="/reports" element={<MyReports />} />
-                  <Route path="/reports/digital-insights" element={<DigitalInsights />} />
-                  <Route path="/reports/conversation-intelligence" element={<ConversationIntelligence />} />
-                  <Route path="/reports/conversation-intelligence/silver" element={<ConversationIntelligence tier="silver" />} />
-                  <Route path="/reports/conversation-intelligence/gold" element={<ConversationIntelligence tier="gold" />} />
                   <Route path="/reports/sms-conversation-intelligence" element={<SmsConversationIntelligence />} />
-                  <Route path="/reports/sms-conversation-intelligence/lsa" element={<SmsConversationIntelligence only="lsa" />} />
                   <Route path="/reports/voice-conversation-intelligence" element={<VoiceConversationIntelligence />} />
-                  <Route path="/reports/artifact/:id" element={<ArtifactView />} />
                   <Route path="/agent-studio" element={<AgentStudio />} />
                   <Route path="/agent-studio/agent" element={<AgentConfig />} />
                   <Route path="/agent-studio/agent/knowledge" element={<KnowledgeSources />} />
@@ -222,7 +199,7 @@ function Demo({ data, slug }: { data: Loaded; slug: string }) {
                   <Route path="/agent-studio/agent/workflow/sms" element={<Navigate to={`/agent-studio/agent/workflow/${SUPPORT_SMS_SLUG}`} replace />} />
                   <Route path="/agent-studio/agent/workflow/voice" element={<Navigate to={`/agent-studio/agent/workflow/${SUPPORT_VOICE_SLUG}`} replace />} />
                   <Route path="/agent-studio/agent/workflow/:channel" element={<AgentWorkflow />} />
-                  <Route path="*" element={<Navigate to="/dashboards/marketing" replace />} />
+                  <Route path="*" element={<Navigate to="/agent-studio" replace />} />
                 </Route>
               </Routes>
             </ScreenBoundary>
