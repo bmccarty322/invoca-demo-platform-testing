@@ -20,7 +20,7 @@ import { CustomerProfile, DigitalInsightsReport, InteractionRow, DashboardView, 
 import { sweepValue } from "./dashSweep.ts";
 
 const QM_SCORE_MEAN = 71;   // true mean of the agent scorecard series
-const MODEL = "claude-opus-4-8";
+export const MODEL = "claude-opus-4-8";
 const FAST_MODEL = "claude-haiku-4-5-20251001";
 
 /* Identity + canonical terminology, chosen FAST up-front (a tiny call before the pool)
@@ -270,7 +270,7 @@ type Progress = (e: { phase: string; status: "start" | "done" }) => void;
    Uses STREAMING: with large max_tokens + high effort a phase can exceed the
    SDK's 10-minute non-streaming ceiling (which throws before the request is even
    sent), so we stream and await the final message. */
-async function structured<T>(client: Anthropic, zodType: any, prompt: string, maxTokens: number, model: string = MODEL): Promise<T> {
+export async function structured<T>(client: Anthropic, zodType: any, prompt: string, maxTokens: number, model: string = MODEL): Promise<T> {
   const stream = client.messages.stream({
     model,
     max_tokens: maxTokens,
