@@ -15,6 +15,11 @@ elif git show-ref --verify --quiet refs/remotes/fork/staging; then
 else
   git checkout -b staging origin/main
 fi
+# Edits made to your fork's staging on github.com (e.g. in the browser) come in too.
+git fetch fork 2>/dev/null || true
+if git show-ref --verify --quiet refs/remotes/fork/staging; then
+  git merge fork/staging -m "Merge fork staging" || { echo "Merge conflicts with fork/staging. Resolve, commit, run again."; exit 1; }
+fi
 echo "→ Merging the latest main (ddesai-invoca) into staging"
 if ! git merge origin/main -m "Merge main into staging"; then
   echo; echo "Merge conflicts. Resolve the files git lists (ask Claude Code), then: git add -A && git commit"; exit 1
