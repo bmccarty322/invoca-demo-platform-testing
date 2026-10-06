@@ -11,6 +11,15 @@ The end state is a clickable React app mirroring the Invoca platform, where ever
 data-driven screen reads from one **canonical customer profile** that an AI
 **generation engine** produces per customer.
 
+## How the team ships changes (read first)
+`main` is the team's STAGING area; production is moved from `main` by an outside process.
+Never work directly on `main`: `npm run start-work -- <name>` pulls the latest `main` and creates
+`<you>/<name>`; make changes with Claude Code; `npm run ship-branch` merges the newest `main` in,
+type-checks and pushes the branch; open a pull request into `main`; after merging,
+`npm run check-deploy` confirms staging (https://invoca-demo-platform-testing.onrender.com) runs it.
+Flow diagram, rules and one-time setup: **`docs/TEAM_WORKFLOW.md`**.
+⚠️ Do not commit demos created while testing: they land in `src/data/generated/` and ship to everyone.
+
 ## Tech stack
 - **Vite + React + TypeScript**, **React Router**, **Zod** (schema + validation)
 - Node 25 (runs `.ts` directly for the engine)
