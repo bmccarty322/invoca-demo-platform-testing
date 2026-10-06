@@ -49,7 +49,10 @@ for (const [name, t] of [["SMS", sms], ["voice", voice]] as const) {
   ok(t.includes(SUPPORT_LINES.live) && t.includes(SUPPORT_LINES.callback), `${name}: has the exact lines a reader can detect an escalation by`);
   ok(pb.scenarios.every((s) => t.includes(s.title.toUpperCase()) && t.includes(s.lookup)), `${name}: carries every scenario and its invented lookup`);
   ok(t.includes(pb.customer.name) && pb.customer.summary.every((x) => t.includes(x)), `${name}: carries the whole account record`);
-  ok(!/ONLY job is to QUALIFY/.test(t) && !/do NOT sell, quote prices, or resolve/.test(t) && !/never attempt to resolve/i.test(t), `${name}: no routing-only language that would forbid resolving`);
+  const supportHalf = t.split("THE SUPPORT PATH.")[1] ?? "";
+  ok(supportHalf.length > 500 && !/ONLY job is to QUALIFY/.test(supportHalf) && !/do NOT sell, quote prices, or resolve/.test(supportHalf) && !/never attempt to resolve/i.test(supportHalf), `${name}: the support path has no routing-only language that would forbid resolving`);
+  ok(/TWO kinds of conversation/.test(t) && /=== SALES INSTRUCTIONS START ===/.test(t) && t.indexOf("SALES INSTRUCTIONS START") < t.indexOf("THE SUPPORT PATH."), `${name}: a two-path agent, sales instructions first and the support path after`);
+  ok(/ignore that: your opening is described at the end/.test(t) && !/Thanks for calling .* support\./.test(t), `${name}: one opening for both paths, not the sales agent's own`);
   ok(/IF THEY ASK FOR A PERSON, A MANAGER OR A CALLBACK, DO IT AT ONCE/.test(t) && /NEVER ask what the problem is/.test(t), `${name}: never makes someone justify wanting a person`);
   ok(/never contradict/i.test(t) && /sample data/i.test(t), `${name}: honest about being a demo if sincerely asked`);
 }

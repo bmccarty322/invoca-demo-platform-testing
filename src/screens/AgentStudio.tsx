@@ -1,5 +1,5 @@
 import { Link } from "react-router-dom";
-import { CUSTOMER, isSupportWorkflowPath } from "../customer/mode";
+import { CUSTOMER, isCustomerWorkflowPath } from "../customer/mode";
 import { useProfile } from "../data/ProfileContext";
 import { useAgentWorkflows, createdWorkflowPath, type CreatedWorkflow } from "../data/agentWorkflows";
 import { WorkflowRowMenu } from "../components/WorkflowRowMenu";
@@ -68,7 +68,7 @@ export function AgentStudio() {
       live: "-",
       created: w,
     })),
-  ].filter((w) => !CUSTOMER || isSupportWorkflowPath(w.to)) as WfRow[];
+  ].filter((w) => !CUSTOMER || isCustomerWorkflowPath(w.to)) as WfRow[];
 
   return (
     <div className="as-page">

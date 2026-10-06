@@ -63,6 +63,7 @@ import { FeedbackBoard } from "./screens/FeedbackBoard";
 import { ReleaseNotes } from "./screens/ReleaseNotes";
 import { IngestOMatic } from "./screens/IngestOMatic";
 import { NAV } from "./components/nav";
+import { CustomerLinkSettings } from "./screens/CustomerLinkSettings";
 
 /* Some screens are EXACT static copies of real pages (the Invoca Exchange and
    the Shady Blinds Google Ads console), served from public/*.html so the real
@@ -81,6 +82,7 @@ const BUILT: Record<string, ReactNode> = {
   "/call-review": <CallReview />,
   "/agent-studio": <AgentStudio />,
   "/signal": <SignalManager />,
+  "/settings": <CustomerLinkSettings />,
 };
 
 /* Standalone screens render OUTSIDE the app shell (their own full-page chrome). */

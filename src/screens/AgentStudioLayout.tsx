@@ -1,5 +1,5 @@
 import { useState, type ReactNode } from "react";
-import { CUSTOMER, isSupportWorkflowPath } from "../customer/mode";
+import { CUSTOMER, isCustomerWorkflowPath } from "../customer/mode";
 import { Link, useLocation, useNavigate } from "react-router-dom";
 import { useProfile } from "../data/ProfileContext";
 import { CreateWorkflowModal } from "../components/CreateWorkflowModal";
@@ -58,7 +58,7 @@ export function AgentStudioLayout({ children }: { children: ReactNode }) {
       warn: true,
       id: w.id,
     })),
-  ].filter((w) => !CUSTOMER || isSupportWorkflowPath(w.to));
+  ].filter((w) => !CUSTOMER || isCustomerWorkflowPath(w.to));
 
   return (
     <div className="ag-page">

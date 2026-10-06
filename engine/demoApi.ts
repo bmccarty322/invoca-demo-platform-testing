@@ -183,7 +183,9 @@ export async function handleDemoApi(
         supportSource = r.source; supportError = r.error;
         const p: any = rec.profile;
         const keep = (p.reports?.extraWorkflows ?? []).filter((w: any) => w?.slug !== sp.SUPPORT_SMS_SLUG && w?.slug !== sp.SUPPORT_VOICE_SLUG);
-        const profile = { ...p, reports: { ...p.reports, extraWorkflows: [...keep, ...sp.supportWorkflows(p, r.playbook)] } };
+        /* The customer reads the NORMAL Voice and SMS workflows, so no extra Support workflows are added (and any
+           added by an earlier version are removed): the support path is the Need Support side of the same agent. */
+        const profile = { ...p, reports: { ...p.reports, extraWorkflows: keep } };
         target = saveDemo({ ...rec, profile, updatedAt: new Date(now).toISOString(), updatedBy: user });
         brainsIn = {
           [sp.SUPPORT_BRAIN_KEYS.sms]: { brain: sp.supportBrain(p, r.playbook, "sms"), greeting: sp.supportGreeting(p, "sms") },

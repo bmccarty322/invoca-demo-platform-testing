@@ -4,6 +4,6 @@
    cannot flip it, and the staff bundle carries none of the customer wiring. */
 export const CUSTOMER: boolean = (import.meta.env as Record<string, unknown>).VITE_CUSTOMER === "1";
 
-/** The only workflows a customer sees: the Support pair. The derived Voice/SMS routing pair
- *  would preview the Support agent under a diagram that describes a different one. */
-export const isSupportWorkflowPath = (to: string) => /\/workflow\/support-(sms|voice)$/.test(to);
+/** The only workflows a customer sees: the standard Voice and SMS pair, each with a Sales and a
+ *  Support path. Authored extra workflows and ones the SE created are internal. */
+export const isCustomerWorkflowPath = (to: string) => /\/workflow\/(sms|voice)$/.test(to);

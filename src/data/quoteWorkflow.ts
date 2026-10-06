@@ -279,6 +279,6 @@ export function extraWorkflowsFor(profile: CustomerProfile, quotes: LsaQuote[]):
  */
 export function useExtraWorkflows(profile: CustomerProfile): ExtraWorkflow[] {
   const all = extraWorkflowsFor(profile, useQuoteCaptures().capturedFor(profile.id));
-  /* Customer build: only the Support pair (see src/customer/mode.ts). Dead code in the staff app. */
-  return CUSTOMER ? all.filter((w) => w.support) : all;
+  /* Customer build: no extra workflows (see src/customer/mode.ts). Dead code in the staff app. */
+  return CUSTOMER ? [] : all;
 }

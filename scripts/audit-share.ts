@@ -279,9 +279,9 @@ fs.rmSync(tmp, { recursive: true, force: true });
   ok(r.status === 200 && r.body.share.supportSource === "fallback", "support: true generates the playbook on the server and reports its source");
   ok(JSON.stringify(Object.keys(rec.share.brains).sort()) === JSON.stringify(["sms-support", "voice-support"]), "the stored agents are the server's two Support agents; a browser-supplied brain is ignored");
   ok(!JSON.stringify(rec.share.brains).includes("IGNORE"), "no prompt text from the request reaches a stored brain");
-  ok((rec.profile.reports.extraWorkflows as any[]).filter((w) => w.support).length === 2, "the two Support workflows are added to the demo the customer will read");
+  ok((rec.profile.reports.extraWorkflows as any[]).filter((w) => w.support).length === 0, "no extra Support workflows are added: the customer reads the standard Voice and SMS pair");
   await api.handleDemoApi("POST", `/api/demos/${d2.id}/share`, { support: true }, user);
-  ok(((store.getDemo(d2.id) as any).profile.reports.extraWorkflows as any[]).length === 2, "refreshing replaces the Support workflows rather than duplicating them");
+  ok(((store.getDemo(d2.id) as any).profile.reports.extraWorkflows as any[]).length === 0, "refreshing leaves no Support workflows behind");
   if (savedKey) process.env.ANTHROPIC_API_KEY = savedKey;
 }
 

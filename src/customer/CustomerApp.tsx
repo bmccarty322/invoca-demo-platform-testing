@@ -31,7 +31,6 @@ import { KnowledgeSources } from "../screens/KnowledgeSources";
 import { AiRecommendations } from "../screens/AiRecommendations";
 import { AgentWorkflow } from "../screens/AgentWorkflow";
 import { SmsPreviewPage } from "../screens/SmsPreviewPage";
-import { SUPPORT_SMS_SLUG, SUPPORT_VOICE_SLUG } from "../data/supportPlaybook";
 
 /** The rail a customer sees. Everything else in the product is not part of this demo. */
 const ALLOWED_NAV = NAV.filter((n) => ["/agent-studio", "/reports"].includes(n.path));
@@ -128,7 +127,7 @@ function Banners({ events, softExpired, softDate }: { events: CustomerEvent[]; s
   }, [callEnds]);
   return (
     <div className="cust-banners" aria-live="polite">
-      {softExpired ? <div className="cust-banner cust-banner-warn">The live agents in this demo turned off on {softDate}. The dashboards, reports and workflows are still here to explore.</div> : null}
+      {softExpired ? <div className="cust-banner cust-banner-warn">The live agents in this demo turned off on {softDate}. The workflows and reports are still here to explore.</div> : null}
       {callEnds ? <div className="cust-banner">Demo calls last up to 5 minutes. Time left: {Math.floor(left / 60)}:{String(left % 60).padStart(2, "0")}</div> : null}
       {esc ? <div className="cust-banner cust-banner-ok">{esc}</div> : null}
     </div>
@@ -195,10 +194,8 @@ function Demo({ data, slug }: { data: Loaded; slug: string }) {
                   <Route path="/agent-studio/agent" element={<AgentConfig />} />
                   <Route path="/agent-studio/agent/knowledge" element={<KnowledgeSources />} />
                   <Route path="/agent-studio/agent/recommendations" element={<AiRecommendations />} />
-                  {/* The derived routing pair is not in this demo; send old links to the Support pair. */}
-                  <Route path="/agent-studio/agent/workflow/sms" element={<Navigate to={`/agent-studio/agent/workflow/${SUPPORT_SMS_SLUG}`} replace />} />
-                  <Route path="/agent-studio/agent/workflow/voice" element={<Navigate to={`/agent-studio/agent/workflow/${SUPPORT_VOICE_SLUG}`} replace />} />
-                  <Route path="/agent-studio/agent/workflow/:channel" element={<AgentWorkflow />} />
+                  <Route path="/agent-studio/agent/workflow/sms" element={<AgentWorkflow />} />
+                  <Route path="/agent-studio/agent/workflow/voice" element={<AgentWorkflow />} />
                   <Route path="*" element={<Navigate to="/agent-studio" replace />} />
                 </Route>
               </Routes>

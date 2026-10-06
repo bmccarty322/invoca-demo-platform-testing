@@ -72,7 +72,10 @@ ok(/CUSTOMER \? allRows\.filter/.test(code("src/screens/MyReports.tsx")), "My Re
 ok(/<Navigate to="\/agent-studio" replace \/>/.test(app) && !/Navigate to="\/dashboards/.test(app), "the customer lands on Agent Studio");
 ok(/hydrateDemo\([^)]*,\s*false,/.test(app), "the saved data layer loads READ-ONLY");
 ok(!/from "\.\.\/screens\/(Launch|GoogleSearch|Salesforce\w*|Insights\w*|Signal\w*|SemanticSignal\w*|FeedbackBoard|ReplicaPage|Integrations|ChatGptAd)"/.test(app) && !/DemoLibraryContext|AiAssistantDrawer/.test(app), "the customer route table imports no staff, library or replica screen");
-ok(/isSupportWorkflowPath/.test(code("src/screens/AgentStudio.tsx")) && /isSupportWorkflowPath/.test(code("src/screens/AgentStudioLayout.tsx")) && /w\.support/.test(code("src/data/quoteWorkflow.ts")), "a customer sees only the Support workflows");
+ok(/isCustomerWorkflowPath/.test(code("src/screens/AgentStudio.tsx")) && /isCustomerWorkflowPath/.test(code("src/screens/AgentStudioLayout.tsx")) && /CUSTOMER \? \[\]/.test(code("src/data/quoteWorkflow.ts")), "a customer sees only the standard Voice and SMS workflows (Sales and Support paths), no extras");
+ok(/workflow\/sms/.test(app) && /workflow\/voice/.test(app) && !/workflow\/:channel/.test(app), "only the two standard workflow pages are routable");
+ok(/Settings/.test(code("src/screens/CustomerLinkSettings.tsx")) && /"\/settings": <CustomerLinkSettings/.test(code("src/App.tsx")) && !/settings/.test(app), "internal Settings shows the customer link and password; the customer build has no Settings");
+ok(!/dashboards/i.test(code("src/components/SharePanel.tsx").replace(/No dashboards, no Ask AI/, "")), "the share panel no longer promises dashboards");
 ok(!/localStorage/.test(code("src/customer/CustomerProfileContext.tsx")), "the customer profile is never written to localStorage");
 
 /* ── the server serves it ahead of the gate ── */

@@ -18,6 +18,7 @@
    person or business.
    ============================================================================= */
 
+import { salesBrainFor } from "./salesPath.ts";
 import type { CustomerProfile, ExtraWorkflow, SupportPlaybook, SupportScenario } from "./schema.ts";
 
 export const SUPPORT_SMS_SLUG = "support-sms";
@@ -123,8 +124,8 @@ export function fallbackSupportPlaybook(profile: CustomerProfile): SupportPlaybo
 /** The opener each channel starts with. */
 export function supportGreeting(profile: Pick<CustomerProfile, "customerName">, channel: "sms" | "voice"): string {
   return channel === "voice"
-    ? `Thanks for calling ${profile.customerName} support. I'm the AI assistant. What can I help you with today?`
-    : `Hi, this is ${profile.customerName} support. I'm the AI assistant. What can I help you with today?`;
+    ? `Thanks for calling ${profile.customerName}. I'm the AI assistant. How can I help you today?`
+    : `Hi, this is ${profile.customerName}. I'm the AI assistant. How can I help you today?`;
 }
 
 /** The two workflows that put the playbook in Agent Studio. Branches are the SCENARIOS, so the
@@ -162,6 +163,9 @@ export function supportBrain(profile: CustomerProfile, pb: SupportPlaybook, chan
     customerName: profile.customerName,
     industry: profile.industry,
     supportPlaybook: pb,
+    /* The normal agent becomes the sales path; the playbook is the support path. Sharing must never fail on a
+       profile too thin to build the sales side from: it then degrades to the support path alone. */
+    salesBrain: (() => { try { return salesBrainFor(profile, channel); } catch { return undefined; } })(),
     ...(channel === "voice"
       ? { voiceGreeting: supportGreeting(profile, "voice") }
       : { smsGreeting: supportGreeting(profile, "sms") }),

@@ -27,7 +27,7 @@
        agent.
    ============================================================================= */
 
-import type { CustomerProfile, AgentConfigView } from "./schema";
+import type { CustomerProfile, AgentConfigView } from "./schema.ts";
 
 /** Mirrors `SmsWorkflowFlow` in `workflowDrawers.ts`, declared here so the brain type is local. */
 export interface SmsFlowNodeShape {
@@ -333,7 +333,7 @@ export async function askSmsAgent(brain: SmsBrain, history: { role: "user" | "as
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ brain, messages: history }),
       });
-      const data = await res.json().catch(() => ({}) as any);
+      const data: any = await res.json().catch(() => ({}));
       if (res.ok) return String(data.reply ?? "").replace(/\*\*|__|`/g, "") || "…";
       lastErr = new Error(data?.error || "Chat failed.");
       if (res.status < 500 && res.status !== 429) break;   // non-transient → stop

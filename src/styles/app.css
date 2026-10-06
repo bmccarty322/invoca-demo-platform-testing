@@ -6314,3 +6314,9 @@ body:has(.vp-root) .aiad--left .aiad-panel {
   .ing-body { grid-template-columns: 1fr; }
   .ing-tiles { grid-template-columns: 1fr; }
 }
+
+/* Settings: customer link (CustomerLinkSettings.tsx). Own prefix .shs-. */
+.shs-page { padding: 32px 40px; max-width: 760px; }
+.shs-title { margin: 0 0 8px; font-size: 24px; font-weight: 400; color: #15243e; }
+.shs-sub { margin: 0 0 24px; font-size: 14px; color: #5b6577; line-height: 1.5; }
+.shp-inline { max-width: none; width: auto; background: #fff; border: 1px solid #e7e9eb; border-radius: 8px; padding: 24px; }
