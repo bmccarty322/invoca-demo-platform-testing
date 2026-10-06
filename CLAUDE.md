@@ -12,12 +12,15 @@ data-driven screen reads from one **canonical customer profile** that an AI
 **generation engine** produces per customer.
 
 ## How the team ships changes (read first)
-`main` is the team's STAGING area; production is moved from `main` by an outside process.
-Never work directly on `main`: `npm run start-work -- <name>` pulls the latest `main` and creates
-`<you>/<name>`; make changes with Claude Code; `npm run ship-branch` merges the newest `main` in,
-type-checks and pushes the branch; open a pull request into `main`; after merging,
-`npm run check-deploy` confirms staging (https://invoca-demo-platform-testing.onrender.com) runs it.
-Flow diagram, rules and one-time setup: **`docs/TEAM_WORKFLOW.md`**.
+`origin` = ddesai-invoca (the team's FINAL repo; its `main` is the team's STAGING area and what the
+Render sandbox https://invoca-demo-platform-testing.onrender.com/ builds); `fork` = bmccarty322.
+Production is moved from `main` by an outside process. Flow: `npm run start-work` (pull latest main
+into the `staging` branch) -> change with Claude Code on `staging` -> `npm run push-staging` (merges
+newest main, type-checks, pushes to the fork's staging) -> test locally with `npm run serve` ->
+the user approves -> `npm run promote` (asks for YES, pushes staging to origin main) ->
+`npm run check-deploy` and final review on the sandbox. Never push to `main` any other way, never
+work on `main`, keep ONE piece of work in `staging` at a time. Diagram, rules and one-time setup:
+**`docs/TEAM_WORKFLOW.md`**.
 ⚠️ Do not commit demos created while testing: they land in `src/data/generated/` and ship to everyone.
 
 ## Tech stack
