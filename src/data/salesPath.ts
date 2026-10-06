@@ -15,9 +15,12 @@ import { DEFAULT_ESCALATE_HANDLING, DEFAULT_SUPPORT_INTENT } from "./voiceAgentS
 
 export function salesBrainFor(profile: CustomerProfile, channel: "sms" | "voice"): ChatBrain {
   const ac: any = profile.reports.agentConfig;
+  /* ⚠️ A DEMO: EVERY NEW OPPORTUNITY IS SERVICEABLE. The prospect's real service area (a ZIP list, a
+     "we serve X" line, an out-of-area script) would let the agent turn a customer's own tester away on
+     a made-up ZIP, which defeats a demo. The sales path therefore carries none of it. */
   if (channel === "sms") {
     const b: any = buildSmsBrain(profile as any, ac);
-    return { ...b, customerName: profile.customerName, industry: profile.industry } as ChatBrain;
+    return { ...b, customerName: profile.customerName, industry: profile.industry, serviceArea: undefined } as ChatBrain;
   }
   const spec = voiceSpecFor(profile);
   /* The sales branches only: the support side is the other path of this agent. */
@@ -41,14 +44,14 @@ export function salesBrainFor(profile: CustomerProfile, channel: "sms" | "voice"
     qaPairs: ac?.aiRecommendations?.find((r: any) => r.qaPairs?.length)?.qaPairs ?? [],
     knowledge: ac?.knowledgeSources?.map((k: any) => k.name) ?? [],
     playbook: ac?.smsPlaybook,
-    serviceArea: ac?.serviceArea,
+    serviceArea: undefined,
     voicePaths: sales,
     voiceMinimal: false,
     voiceBooking: false,
-    serviceZips: spec?.serviceZips,
-    outOfAreaScript: spec?.outOfAreaScript,
+    serviceZips: undefined,
+    outOfAreaScript: undefined,
     voiceRules: spec?.rules,
-    voiceSteps: spec?.informSteps,
+    voiceSteps: undefined,
     voiceEscalate: spec?.escalateHandling && spec.escalateHandling !== DEFAULT_ESCALATE_HANDLING ? spec.escalateHandling : undefined,
     voiceSupportIntent: spec?.supportIntent && spec.supportIntent !== DEFAULT_SUPPORT_INTENT ? spec.supportIntent : undefined,
     voiceRouting: q.length ? {

@@ -34,6 +34,7 @@ import { CallDetail } from "./screens/CallDetail";
 import { AgentStudio } from "./screens/AgentStudio";
 import { AgentConfig } from "./screens/AgentConfig";
 import { KnowledgeSources } from "./screens/KnowledgeSources";
+import { KnowledgeDoc } from "./screens/KnowledgeDoc";
 import { AiRecommendations } from "./screens/AiRecommendations";
 import { AgentWorkflow } from "./screens/AgentWorkflow";
 import { SignalManager } from "./screens/SignalManager";
@@ -229,6 +230,7 @@ export default function App() {
             {/* Agent Studio → agent configuration editor (opened from a workflow row) */}
             <Route path="/agent-studio/agent" element={<AgentConfig />} />
             <Route path="/agent-studio/agent/knowledge" element={<KnowledgeSources />} />
+            <Route path="/agent-studio/agent/knowledge/doc" element={<KnowledgeDoc />} />
             <Route path="/agent-studio/agent/recommendations" element={<AiRecommendations />} />
             <Route path="/agent-studio/agent/workflow/:channel" element={<AgentWorkflow />} />
             {/* A workflow the SE created with the Create Workflow modal. Its own path segment,

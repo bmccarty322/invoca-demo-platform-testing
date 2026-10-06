@@ -6320,3 +6320,10 @@ body:has(.vp-root) .aiad--left .aiad-panel {
 .shs-title { margin: 0 0 8px; font-size: 24px; font-weight: 400; color: #15243e; }
 .shs-sub { margin: 0 0 24px; font-size: 14px; color: #5b6577; line-height: 1.5; }
 .shp-inline { max-width: none; width: auto; background: #fff; border: 1px solid #e7e9eb; border-radius: 8px; padding: 24px; }
+
+/* Knowledge Sources: an opened document (KnowledgeDoc.tsx). Own prefix .kd-. */
+.kd-back { margin: 0 0 12px; font-size: 13px; }
+.kd-doc { max-width: 760px; }
+.kd-sec { margin: 22px 0 0; }
+.kd-h { margin: 0 0 8px; font-size: 16px; font-weight: 700; color: #15243e; }
+.kd-p { margin: 0 0 8px; font-size: 14px; line-height: 1.5; color: #343a40; }

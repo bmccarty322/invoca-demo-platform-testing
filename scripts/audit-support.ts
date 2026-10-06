@@ -51,6 +51,7 @@ for (const [name, t] of [["SMS", sms], ["voice", voice]] as const) {
   ok(t.includes(pb.customer.name) && pb.customer.summary.every((x) => t.includes(x)), `${name}: carries the whole account record`);
   const supportHalf = t.split("THE SUPPORT PATH.")[1] ?? "";
   ok(supportHalf.length > 500 && !/ONLY job is to QUALIFY/.test(supportHalf) && !/do NOT sell, quote prices, or resolve/.test(supportHalf) && !/never attempt to resolve/i.test(supportHalf), `${name}: the support path has no routing-only language that would forbid resolving`);
+  ok(/EVERY NEW OPPORTUNITY IS SERVICEABLE/.test(t) && /EXISTING CUSTOMERS ON THE SALES PATH/.test(t) && !/we do not serve|outside our service area|out-of-area/i.test((t.split("SALES INSTRUCTIONS START")[1] ?? "").split("SALES INSTRUCTIONS END")[0]), `${name}: new prospects are always serviceable (no area gate in the sales path), and existing customers can be handled or handed to support`);
   ok(/TWO kinds of conversation/.test(t) && /=== SALES INSTRUCTIONS START ===/.test(t) && t.indexOf("SALES INSTRUCTIONS START") < t.indexOf("THE SUPPORT PATH."), `${name}: a two-path agent, sales instructions first and the support path after`);
   ok(/ignore that: your opening is described at the end/.test(t) && !/Thanks for calling .* support\./.test(t), `${name}: one opening for both paths, not the sales agent's own`);
   ok(/IF THEY ASK FOR A PERSON, A MANAGER OR A CALLBACK, DO IT AT ONCE/.test(t) && /NEVER ask what the problem is/.test(t), `${name}: never makes someone justify wanting a person`);

@@ -28,6 +28,7 @@ import { VoiceConversationIntelligence } from "../screens/VoiceConversationIntel
 import { AgentStudio } from "../screens/AgentStudio";
 import { AgentConfig } from "../screens/AgentConfig";
 import { KnowledgeSources } from "../screens/KnowledgeSources";
+import { KnowledgeDoc } from "../screens/KnowledgeDoc";
 import { AiRecommendations } from "../screens/AiRecommendations";
 import { AgentWorkflow } from "../screens/AgentWorkflow";
 import { SmsPreviewPage } from "../screens/SmsPreviewPage";
@@ -193,6 +194,7 @@ function Demo({ data, slug }: { data: Loaded; slug: string }) {
                   <Route path="/agent-studio" element={<AgentStudio />} />
                   <Route path="/agent-studio/agent" element={<AgentConfig />} />
                   <Route path="/agent-studio/agent/knowledge" element={<KnowledgeSources />} />
+                  <Route path="/agent-studio/agent/knowledge/doc" element={<KnowledgeDoc />} />
                   <Route path="/agent-studio/agent/recommendations" element={<AiRecommendations />} />
                   <Route path="/agent-studio/agent/workflow/sms" element={<AgentWorkflow />} />
                   <Route path="/agent-studio/agent/workflow/voice" element={<AgentWorkflow />} />

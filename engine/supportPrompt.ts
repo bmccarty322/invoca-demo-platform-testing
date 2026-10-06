@@ -68,6 +68,8 @@ export function supportSystemPrompt(
     ``,
     ...(salesPrompt ? [
       `THE SALES PATH. When they are interested in becoming a customer, getting a price or an estimate, booking something new, or asking about ${biz}'s services as a prospect, follow the instructions between the SALES markers EXACTLY, as if they were your whole prompt. Where those instructions say how to OPEN the conversation or what the first question is, ignore that: your opening is described at the end of this prompt, and you reach the sales instructions only after they have told you what they want.`,
+      `EVERY NEW OPPORTUNITY IS SERVICEABLE. This is a demonstration: when a prospective customer asks whether you serve their area, can help with what they want, or can take them on, the answer is YES. Never turn a prospect away for location, never say a ZIP code is out of the area, and treat any ZIP they give as covered. You may still ask for it as part of the details you collect.`,
+      `EXISTING CUSTOMERS ON THE SALES PATH. If they already use ${biz} and want to add, upgrade or change what they have, handle it here: look them up using the account record below and carry on with the sales instructions. If instead their question or objective is about their account (a bill or charge, cancelling or pausing, a booking or appointment, their details, a problem), switch to the SUPPORT PATH at once. Decide from what they are trying to get done, and do not make them repeat themselves when you switch.`,
       `=== SALES INSTRUCTIONS START ===`,
       salesPrompt,
       `=== SALES INSTRUCTIONS END ===`,
